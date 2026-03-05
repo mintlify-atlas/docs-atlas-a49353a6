@@ -1,80 +1,303 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: Quick Start
+description: Get your first MOQT application running in minutes
 ---
 
-## Get started in three steps
+This guide will get you up and running with Moxygen using the **date server** sample - a simple publisher that broadcasts the current date and time every second.
 
-Get your documentation site running locally and make your first customization.
+## Prerequisites
 
-### Step 1: Set up your local environment
+Before starting, make sure you have:
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
+- [Built Moxygen](/installation) and its dependencies
+- Generated test certificates (see [Certificate Generation](/installation#certificate-generation-for-testing))
+
+## Overview
+
+You'll be running two components:
+
+1. **Date Server** (`moqdateserver`) - A MOQT publisher that broadcasts timestamps
+2. **Text Client** (`moqtextclient`) - A MOQT subscriber that receives and displays the data
+
+```
+┌─────────────────┐         MOQT/QUIC        ┌─────────────────┐
+│   Date Server   │ ─────────────────────► │   Text Client   │
+│  (Publisher)    │   moq-date/date track   │  (Subscriber)   │
+└─────────────────┘                          └─────────────────┘
+```
+
+## Step-by-Step Guide
+
+<Steps>
+  <Step title="Set the build path">
+    First, locate where the compiled binaries are:
     
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
+    ```bash
+    MOXYGEN_BUILD_PATH=$(./build/fbcode_builder/getdeps.py show-build-dir moxygen)
+    echo $MOXYGEN_BUILD_PATH
+    ```
     
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+    This environment variable will be used in subsequent commands.
+  </Step>
 
-### Step 2: Deploy your changes
-
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
+  <Step title="Start the date server">
+    Open a terminal and start the date server:
     
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+    ```bash
+    $MOXYGEN_BUILD_PATH/moxygen/samples/date/moqdateserver \
+      -port 4433 \
+      -cert ./certs/certificate.pem \
+      -key ./certs/certificate.key \
+      --logging DBG1
+    ```
+    
+    **What these flags mean:**
+    - `-port 4433` - Listen on port 4433 (standard QUIC port)
+    - `-cert` / `-key` - TLS certificate and private key for QUIC
+    - `--logging DBG1` - Enable debug logging to see what's happening
+    
+    <Note>
+    You should see log messages indicating the server is running and waiting for connections.
+    </Note>
+  </Step>
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+  <Step title="Connect with the text client">
+    Open a **new terminal** (keep the server running) and run the text client:
+    
+    ```bash
+    $MOXYGEN_BUILD_PATH/moxygen/samples/text-client/moqtextclient \
+      --insecure \
+      --connect_url "https://localhost:4433/moq-date" \
+      --track_namespace "moq-date" \
+      --track_name "date"
+    ```
+    
+    **What these flags mean:**
+    - `--insecure` - Accept self-signed certificates (required for local testing)
+    - `--connect_url` - URL of the date server
+    - `--track_namespace` - Namespace to subscribe to
+    - `--track_name` - Specific track name within the namespace
+    
+    <Warning>
+    The `--insecure` flag bypasses certificate validation. **Never use this in production!** It's only for testing with self-signed certificates.
+    </Warning>
+  </Step>
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+  <Step title="Observe the output">
+    You should see output similar to:
+    
+    ```
+    I1007 12:05:46.516857 3558180 MoQTextClient.cpp:191] run
+    I1007 12:05:46.579533 3558180 MoQTextClient.cpp:250] Largest={29331065, 47}
+    47
+    48
+    49
+    50
+    51
+    52
+    53
+    54
+    55
+    56
+    57
+    58
+    59
+    ObjectStatus=3
+    int extension=1977
+    data extension=AQIDBAU=
+    2025-10-07 12:06:
+    0
+    1
+    2
+    ...
+    ```
+    
+    The client is receiving:
+    - The current date/time string (e.g., `2025-10-07 12:06:`)
+    - Seconds counting from 0 to 59
+    - Extension data attached to objects (for demonstration)
+  </Step>
 
-### Step 3: Go live
+  <Step title="Stop the applications">
+    Press `Ctrl+C` in each terminal to stop the server and client gracefully.
+  </Step>
+</Steps>
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+## What's Happening Under the Hood
 
-## Next steps
+### Publisher Side (Date Server)
 
-Now that you have your docs running, explore these key features:
+The date server implements the `Publisher` interface and:
+
+1. **Publishes to track**: `moq-date/date`
+2. **Generates objects**: Every second, it publishes two objects:
+   - Object 0: The current minute (e.g., `2025-10-07 12:06:`)
+   - Objects 1-60: The current second (e.g., `0`, `1`, `2`, ...)
+3. **Uses groups**: Each minute is a new group, with seconds as objects within that group
+
+**Code reference** (from MoQDateServer.cpp:327-342):
+
+```cpp
+Payload minutePayload(uint64_t group) {
+  time_t in_time_t = group * 60;
+  struct tm local_tm;
+  auto lt = ::localtime_r(&in_time_t, &local_tm);
+  std::stringstream ss;
+  ss << std::put_time(lt, "%Y-%m-%d %H:%M:");
+  return folly::IOBuf::copyBuffer(ss.str());
+}
+
+Payload secondPayload(uint64_t object) {
+  auto secBuf = folly::to<std::string>(object - 1);
+  return folly::IOBuf::copyBuffer(secBuf);
+}
+```
+
+### Subscriber Side (Text Client)
+
+The text client:
+
+1. **Connects** to the server using HTTP/3 WebTransport over QUIC
+2. **Subscribes** to the `moq-date/date` track
+3. **Receives objects** via the `TrackConsumer` interface
+4. **Prints** each object's payload to stdout
+
+### MOQT Concepts in Action
+
+- **Track**: A named stream of objects (`moq-date/date`)
+- **Group**: A collection of related objects (one minute of time)
+- **Object**: Individual data items (seconds and minute strings)
+- **Subgroup**: Fine-grained organization within groups
+
+## Transmission Modes
+
+The date server supports three transmission modes:
+
+<CodeGroup>
+```bash Stream Per Group (default)
+# One QUIC stream per group (per minute)
+$MOXYGEN_BUILD_PATH/moxygen/samples/date/moqdateserver \
+  -port 4433 \
+  -cert ./certs/certificate.pem \
+  -key ./certs/certificate.key \
+  -mode spg
+```
+
+```bash Stream Per Object
+# One QUIC stream per object (per second)
+$MOXYGEN_BUILD_PATH/moxygen/samples/date/moqdateserver \
+  -port 4433 \
+  -cert ./certs/certificate.pem \
+  -key ./certs/certificate.key \
+  -mode spo
+```
+
+```bash Datagram Mode
+# Use unreliable QUIC datagrams instead of streams
+$MOXYGEN_BUILD_PATH/moxygen/samples/date/moqdateserver \
+  -port 4433 \
+  -cert ./certs/certificate.pem \
+  -key ./certs/certificate.key \
+  -mode datagram
+```
+</CodeGroup>
+
+Different modes trade off between:
+- **Latency** - Datagrams have lowest latency but can be lost
+- **Reliability** - Streams guarantee delivery but add overhead
+- **Head-of-line blocking** - More streams = less blocking
+
+## Advanced Client Options
+
+### Subscribe from a Specific Point
+
+Instead of starting from the latest object, you can specify a start point:
+
+```bash
+# Start from group 12345, object 30
+$MOXYGEN_BUILD_PATH/moxygen/samples/text-client/moqtextclient \
+  --insecure \
+  --connect_url "https://localhost:4433/moq-date" \
+  --track_namespace "moq-date" \
+  --track_name "date" \
+  --sg 12345 \
+  --so 30
+```
+
+### Fetch Historical Data
+
+Use `--fetch` to request a specific range of historical objects:
+
+```bash
+# Fetch groups 12340 through 12350
+$MOXYGEN_BUILD_PATH/moxygen/samples/text-client/moqtextclient \
+  --insecure \
+  --connect_url "https://localhost:4433/moq-date" \
+  --track_namespace "moq-date" \
+  --track_name "date" \
+  --fetch \
+  --sg 12340 \
+  --eg 12350
+```
+
+## Common Issues
+
+### Connection Refused
+
+**Problem**: `Connection refused` or `Failed to connect`
+
+**Solutions**:
+- Ensure the date server is running
+- Check that you're using the correct port (4433)
+- Verify firewall isn't blocking the port
+
+### Certificate Errors
+
+**Problem**: TLS/certificate validation errors
+
+**Solutions**:
+- Make sure you generated certificates (`./scripts/create-server-certs.sh`)
+- Verify certificate paths are correct
+- Ensure you're using `--insecure` flag on the client for self-signed certs
+
+### No Data Received
+
+**Problem**: Client connects but doesn't receive any data
+
+**Solutions**:
+- Check track namespace and name match exactly
+- Look at server logs for subscription requests
+- Try adding `--logging DBG1` to the client for debug output
+
+## Next Steps
+
+Now that you have a working MOQT application, explore:
 
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="Architecture" icon="sitemap" href="/architecture">
+    Understand Moxygen's design and core concepts
+  </Card>
+  
+  <Card title="API Reference" icon="code" href="/api/session">
+    Learn the Publisher and Subscriber interfaces
+  </Card>
+  
+  <Card title="Build a Relay" icon="network-wired" href="/guides/relay">
+    Create a relay server to route between publishers and subscribers
+  </Card>
+  
+  <Card title="Sample Applications" icon="flask" href="/samples">
+    Explore other samples including chat and FLV media streaming
+  </Card>
 </CardGroup>
 
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>
+## Additional Samples
+
+Moxygen includes other sample applications to explore:
+
+- **Chat Client** (`moxygen/samples/chat/`) - Bidirectional chat application
+- **FLV Streamer** (`moxygen/samples/flv_streamer_client/`) - Stream video files
+- **FLV Receiver** (`moxygen/samples/flv_receiver_client/`) - Receive video streams
+- **Relay Server** (`moxygen/relay/`) - Full-featured relay implementation
+
+Each demonstrates different aspects of the MOQT protocol and Moxygen's capabilities.

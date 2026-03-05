@@ -1,122 +1,122 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "theme": "mint",
-  "name": "Mint Starter Kit",
+  "name": "Moxygen",
+  "theme": "aspen",
   "colors": {
-    "primary": "#16A34A",
-    "light": "#07C983",
-    "dark": "#15803D"
+    "primary": "#fcd554",
+    "light": "#fce386",
+    "dark": "#bfbec5"
   },
-  "favicon": "/favicon.svg",
+  "favicon": "https://media.brand.dev/12a23223-0b22-4306-ac09-4c7b84954be9.png",
+  "logo": {
+    "light": "https://media.brand.dev/bbf8baf5-8580-4435-b7d6-e9beb555ed10.svg",
+    "dark": "https://media.brand.dev/51791c81-956a-4357-a8e5-a8eaf1a1c617.svg"
+  },
+  "navbar": {
+    "primary": {
+      "type": "github",
+      "href": "https://github.com/facebookexperimental/moxygen"
+    }
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/facebookexperimental/moxygen"
+    }
+  },
   "navigation": {
     "tabs": [
       {
-        "tab": "Guides",
+        "tab": "Documentation",
         "groups": [
           {
-            "group": "Getting started",
+            "group": "Get Started",
+            "pages": ["introduction", "installation", "quickstart"]
+          },
+          {
+            "group": "Core Concepts",
             "pages": [
-              "index",
-              "quickstart",
-              "development"
+              "concepts/architecture",
+              "concepts/moqt-protocol",
+              "concepts/publisher-subscriber",
+              "concepts/relay-forwarding",
+              "concepts/flow-control"
             ]
           },
           {
-            "group": "Customization",
+            "group": "Guides",
             "pages": [
-              "essentials/settings",
-              "essentials/navigation"
+              "guides/building-publisher",
+              "guides/building-subscriber",
+              "guides/setting-up-relay",
+              "guides/media-streaming",
+              "guides/threading-model"
             ]
           },
           {
-            "group": "Writing content",
+            "group": "Sample Applications",
             "pages": [
-              "essentials/markdown",
-              "essentials/code",
-              "essentials/images",
-              "essentials/reusable-snippets"
-            ]
-          },
-          {
-            "group": "AI tools",
-            "pages": [
-              "ai-tools/cursor",
-              "ai-tools/claude-code",
-              "ai-tools/windsurf"
+              "samples/overview",
+              "samples/date-server",
+              "samples/text-client",
+              "samples/chat-client",
+              "samples/flv-streaming"
             ]
           }
         ]
       },
       {
-        "tab": "API reference",
+        "tab": "API Reference",
         "groups": [
           {
-            "group": "API documentation",
+            "group": "Core Classes",
             "pages": [
-              "api-reference/introduction"
+              "api/moq-session",
+              "api/moq-relay-session",
+              "api/publisher",
+              "api/subscriber"
             ]
           },
           {
-            "group": "Endpoint examples",
+            "group": "Consumers",
             "pages": [
-              "api-reference/endpoint/get",
-              "api-reference/endpoint/create",
-              "api-reference/endpoint/delete",
-              "api-reference/endpoint/webhook"
+              "api/track-consumer",
+              "api/subgroup-consumer",
+              "api/fetch-consumer"
+            ]
+          },
+          {
+            "group": "Transport",
+            "pages": [
+              "api/moq-client",
+              "api/moq-server",
+              "api/web-transport"
+            ]
+          },
+          {
+            "group": "Relay & Forwarding",
+            "pages": [
+              "api/moq-relay",
+              "api/moq-forwarder",
+              "api/moq-cache"
+            ]
+          },
+          {
+            "group": "Media",
+            "pages": [
+              "api/moq-mi",
+              "api/flv-parser"
+            ]
+          },
+          {
+            "group": "Utilities",
+            "pages": [
+              "api/moq-types",
+              "api/moq-executor",
+              "api/moq-stats"
             ]
           }
         ]
       }
-    ],
-    "global": {
-      "anchors": [
-        {
-          "anchor": "Documentation",
-          "href": "https://mintlify.com/docs",
-          "icon": "book-open-cover"
-        },
-        {
-          "anchor": "Blog",
-          "href": "https://mintlify.com/blog",
-          "icon": "newspaper"
-        }
-      ]
-    }
-  },
-  "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg"
-  },
-  "navbar": {
-    "links": [
-      {
-        "label": "Support",
-        "href": "mailto:hi@mintlify.com"
-      }
-    ],
-    "primary": {
-      "type": "button",
-      "label": "Dashboard",
-      "href": "https://dashboard.mintlify.com"
-    }
-  },
-  "contextual": {
-    "options": [
-     "copy",
-     "view",
-     "chatgpt",
-     "claude",
-     "perplexity",
-     "mcp",
-     "cursor",
-     "vscode"
-   ]
-  },
-  "footer": {
-    "socials": {
-      "x": "https://x.com/mintlify",
-      "github": "https://github.com/mintlify",
-      "linkedin": "https://linkedin.com/company/mintlify"
-    }
+    ]
   }
 }

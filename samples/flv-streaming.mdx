@@ -1,0 +1,456 @@
+---
+title: FLV Streaming Samples
+description: Stream live and VOD video content over MOQT using FLV packaging
+---
+
+The FLV Streaming samples demonstrate media streaming over MOQT using the MoQMi (MOQT Media Interop) packaging format. These tools convert FLV video to and from MOQT, enabling integration with FFmpeg and browser-based players.
+
+## Overview
+
+Moxygen includes two media streaming applications:
+
+- **MoQFlvStreamerClient** - Converts FLV (H.264 / AAC-LC) to MOQT and publishes to a relay
+- **MoQFlvReceiverClient** - Subscribes to MOQT tracks, demuxes MoQMi, and outputs FLV
+
+These work together to create a complete media streaming pipeline:
+
+```
+┌────────┐      ┌──────────────────┐      ┌───────────┐      ┌──────────────────┐      ┌────────┐
+│ FFmpeg │─────►│ MoQFlvStreamer   │─────►│ MoQ Relay │─────►│ MoQFlvReceiver   │─────►│ FFplay │
+│        │ FLV  │ Client           │ MOQT │           │ MOQT │ Client           │ FLV  │        │
+└────────┘      └──────────────────┘      └───────────┘      └──────────────────┘      └────────┘
+```
+
+## Source Code
+
+The samples are located at:
+```
+moxygen/samples/
+├── flv_streamer_client/MoQFlvStreamerClient.cpp
+└── flv_receiver_client/MoQFlvReceiverClient.cpp
+```
+
+## Why FLV?
+
+FLV was chosen for prototyping because it:
+- Is streaming-friendly (can process bytes as they arrive)
+- Is very simple to parse and generate
+- Carries `AVCDecoderRecord` compatible with MoQMi (no transcoding needed)
+- Uses `AudioSpecificConfig` for audio (simple to decode)
+- Works seamlessly with FFmpeg for low-latency real-time streaming
+
+<Note>
+  FMP4 support may be added in the future for broader compatibility.
+</Note>
+
+## Building the Samples
+
+Both samples are built automatically with Moxygen:
+
+```bash
+./build/fbcode_builder/getdeps.py build moxygen
+```
+
+The binaries will be at:
+```bash
+$MOXYGEN_BUILD_PATH/moxygen/samples/flv_streamer_client/moqflvstreamerclient
+$MOXYGEN_BUILD_PATH/moxygen/samples/flv_receiver_client/moqflvreceiverclient
+```
+
+## MoQFlvStreamerClient
+
+### What It Does
+
+The streamer client:
+- Reads FLV data from a file or FIFO pipe
+- Demuxes video (H.264) and audio (AAC-LC) tracks
+- Packages media into MoQMi format
+- Publishes video and audio tracks to a MOQT relay
+
+### Command-Line Options
+
+| Flag | Description | Default |
+|------|-------------|----------|
+| `-input_flv_file` | FLV input file or FIFO path | `""` (required) |
+| `-connect_url` | URL for WebTransport server | `https://localhost:4433/moq` |
+| `-track_namespace` | Track namespace | `flvstreamer` |
+| `-track_namespace_delimiter` | Namespace delimiter | `/` |
+| `-video_track_name` | Video track name | `video0` |
+| `-audio_track_name` | Audio track name | `audio0` |
+| `-connect_timeout` | Connection timeout in ms | `1000` |
+| `-transaction_timeout` | Transaction timeout in seconds | `120` |
+| `-quic_transport` | Use raw QUIC transport | `false` |
+
+### Basic Usage
+
+Stream an FLV file through a FIFO:
+
+```bash
+# Create FIFO
+mkfifo ~/Movies/input.flv
+
+# Start FFmpeg in one terminal
+ffmpeg -re -i video.mp4 -c:v libx264 -c:a aac -f flv ~/Movies/input.flv
+
+# Start streamer in another terminal
+$MOXYGEN_BUILD_PATH/moxygen/samples/flv_streamer_client/moqflvstreamerclient \
+  --insecure \
+  --input_flv_file ~/Movies/input.flv \
+  --logging DBG1
+```
+
+## MoQFlvReceiverClient
+
+### What It Does
+
+The receiver client:
+- Subscribes to video and audio tracks from a MOQT relay
+- Demuxes MoQMi media format
+- Transmuxes to FLV format
+- Writes output to a file or FIFO pipe
+- Includes dejitter buffer for smooth playback
+
+### Command-Line Options
+
+| Flag | Description | Default |
+|------|-------------|----------|
+| `-flv_outpath` | Output FLV file or FIFO path | `""` (required) |
+| `-connect_url` | URL for WebTransport server | `https://localhost:4433/moq` |
+| `-track_namespace` | Track namespace | `flvstreamer` |
+| `-track_namespace_delimiter` | Namespace delimiter | `/` |
+| `-video_track_name` | Video track name | `video0` |
+| `-audio_track_name` | Audio track name | `audio0` |
+| `-connect_timeout` | Connection timeout in ms | `1000` |
+| `-transaction_timeout` | Transaction timeout in seconds | `120` |
+| `-dejitter_buffer_size_ms` | Dejitter buffer size (adds latency) | `300` |
+| `-fetch` | Use FETCH instead of SUBSCRIBE | `false` |
+| `-quic_transport` | Use raw QUIC transport | `false` |
+
+### Basic Usage
+
+Receive and save to a file:
+
+```bash
+$MOXYGEN_BUILD_PATH/moxygen/samples/flv_receiver_client/moqflvreceiverclient \
+  --insecure \
+  --flv_outpath ~/Movies/output.flv \
+  --logging DBG1
+```
+
+## Complete Examples
+
+### Example 1: VOD Streaming (Save to File)
+
+Stream a test pattern simulating live at 1x speed:
+
+<Steps>
+  <Step title="Start the relay">
+    ```bash
+    $MOXYGEN_BUILD_PATH/moxygen/relay/moqrelayserver \
+      --cert ./certs/certificate.pem \
+      --key ./certs/certificate.key \
+      --endpoint "/moq" \
+      --logging DBG4 \
+      --port 4433
+    ```
+  </Step>
+  <Step title="Create FIFO and start FFmpeg">
+    ```bash
+    mkfifo ~/Movies/fifo.flv
+
+    ffmpeg -y -f lavfi -re \
+      -i smptebars=duration=300:size=320x200:rate=30 \
+      -f lavfi -re \
+      -i sine=frequency=1000:duration=300:sample_rate=48000 \
+      -pix_fmt yuv420p \
+      -c:v libx264 -b:v 180k -g 60 -keyint_min 60 -profile:v baseline -preset veryfast \
+      -c:a aac -b:a 96k \
+      -vf "drawtext=fontfile=/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf: \
+           text='Local time %{localtime\: %Y\/%m\/%d %H.%M.%S} (%{n})': \
+           x=10: y=10: fontsize=16: fontcolor=white: box=1: boxcolor=0x00000099" \
+      -f flv ~/Movies/fifo.flv
+    ```
+
+    <Note>
+      Font file location may vary by OS. On macOS, use `/Library/Fonts/Arial.ttf`
+    </Note>
+  </Step>
+  <Step title="Start the streamer">
+    ```bash
+    $MOXYGEN_BUILD_PATH/moxygen/samples/flv_streamer_client/moqflvstreamerclient \
+      --insecure \
+      --input_flv_file ~/Movies/fifo.flv \
+      --logging DBG1
+    ```
+  </Step>
+  <Step title="Start the receiver">
+    ```bash
+    $MOXYGEN_BUILD_PATH/moxygen/samples/flv_receiver_client/moqflvreceiverclient \
+      --insecure \
+      --flv_outpath ~/Movies/my-moq-out.flv \
+      --logging DBG1
+    ```
+  </Step>
+  <Step title="Verify the output">
+    Check the file with ffprobe:
+    ```bash
+    ffprobe ~/Movies/my-moq-out.flv
+    ```
+
+    Expected output:
+    ```
+    Input #0, flv, from '/Users/jcenzano/Movies/my-moq-out.flv':
+      Duration: 00:01:08.82, start: 55.573000, bitrate: 37 kb/s
+      Stream #0:0: Audio: aac (LC), 48000 Hz, mono, fltp
+      Stream #0:1: Video: h264 (Constrained Baseline), yuv420p(tv, bt470bg/unknown/unknown, progressive), 
+                    320x200 [SAR 1:1 DAR 8:5], 30.30 fps, 30 tbr, 1k tbn
+    ```
+  </Step>
+</Steps>
+
+### Example 2: Live Playback with FFplay
+
+Watch the stream in real-time:
+
+<Steps>
+  <Step title="Follow Example 1 steps 1-3">
+    Start relay, FFmpeg, and streamer as in Example 1.
+  </Step>
+  <Step title="Create output FIFO">
+    ```bash
+    mkfifo ~/Movies/fifo-out.flv
+    ```
+  </Step>
+  <Step title="Start FFplay">
+    ```bash
+    ffplay ~/Movies/fifo-out.flv
+    ```
+  </Step>
+  <Step title="Start the receiver">
+    ```bash
+    $MOXYGEN_BUILD_PATH/moxygen/samples/flv_receiver_client/moqflvreceiverclient \
+      --insecure \
+      --flv_outpath ~/Movies/fifo-out.flv \
+      --logging DBG1
+    ```
+  </Step>
+</Steps>
+
+You should see live playback with approximately 300ms of latency (dejitter buffer).
+
+### Example 3: App-to-Browser Playback
+
+Stream from the app to a WebCodecs-based browser player:
+
+<Steps>
+  <Step title="Start relay with browser-compatible certificates">
+    ```bash
+    $MOXYGEN_BUILD_PATH/moxygen/relay/moqrelayserver \
+      --cert [moq-encoder-player]/certs/certificate.pem \
+      --key [moq-encoder-player]/certs/certificate.key \
+      --endpoint "/moq" \
+      --logging DBG4 \
+      --port 4433
+    ```
+
+    <Note>
+      `[moq-encoder-player]` refers to the [moq-encoder-player](https://github.com/facebookexperimental/moq-encoder-player) project directory.
+    </Note>
+  </Step>
+  <Step title="Start FFmpeg with test pattern">
+    ```bash
+    mkfifo ~/Movies/fifo.flv
+
+    ffmpeg -y -f lavfi -re \
+      -i smptebars=duration=300:size=320x200:rate=30 \
+      -f lavfi -re \
+      -i sine=frequency=1000:duration=300:sample_rate=48000 \
+      -pix_fmt yuv420p \
+      -c:v libx264 -b:v 180k -g 60 -keyint_min 60 -profile:v baseline -preset veryfast \
+      -c:a aac -b:a 96k \
+      -vf "drawtext=fontfile=/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf: \
+           text='Local time %{localtime\: %Y\/%m\/%d %H.%M.%S} (%{n})': \
+           x=10: y=10: fontsize=16: fontcolor=white: box=1: boxcolor=0x00000099" \
+      -f flv ~/Movies/fifo.flv
+    ```
+  </Step>
+  <Step title="Start the streamer">
+    ```bash
+    $MOXYGEN_BUILD_PATH/moxygen/samples/flv_streamer_client/moqflvstreamerclient \
+      --insecure \
+      --input_flv_file ~/Movies/fifo.flv \
+      --logging DBG1
+    ```
+  </Step>
+  <Step title="Open browser player">
+    Install and open [moq-encoder-player](https://github.com/facebookexperimental/moq-encoder-player) at:
+    ```
+    http://localhost:8080/src-player/?local
+    ```
+
+    Configure:
+    - **Namespace**: `flvstreamer`
+    - **Track name**: (leave empty)
+    - Click **Start**
+  </Step>
+</Steps>
+
+You should see the video playing in the browser using WebCodecs.
+
+### Example 4: Browser-to-App Playback
+
+Stream from browser to FFplay:
+
+<Steps>
+  <Step title="Start relay and browser encoder">
+    Start the relay as in Example 3.
+
+    Open the encoder page:
+    ```
+    http://localhost:8080/src-encoder/?local
+    ```
+
+    Configure:
+    - **Namespace**: `flvstreamer`
+    - **Track name prefix**: (leave empty)
+    - **Audio codec**: `AAC-LC`
+    - Click **Start**
+  </Step>
+  <Step title="Create output FIFO and start FFplay">
+    ```bash
+    mkfifo ~/Movies/fifo-out.flv
+    ffplay ~/Movies/fifo-out.flv
+    ```
+  </Step>
+  <Step title="Start the receiver">
+    ```bash
+    $MOXYGEN_BUILD_PATH/moxygen/samples/flv_receiver_client/moqflvreceiverclient \
+      --insecure \
+      --flv_outpath ~/Movies/fifo-out.flv \
+      --logging DBG1
+    ```
+  </Step>
+</Steps>
+
+You should see live playback of the browser camera/microphone in FFplay.
+
+## Advanced: SDI Integration
+
+FFmpeg supports capture and playback cards, enabling SDI integration:
+
+```
+┌─────────┐      ┌────────┐      ┌──────────────┐      ┌──────────┐      ┌────────┐      ┌─────────┐
+│ SDI     │─────►│ FFmpeg │─────►│ MoQFlvStreamer│─────►│ MoQ Relay│─────►│ MoQFlv  │─────►│ FFmpeg  │─────►│ SDI Out │
+│ Source  │      │ Capture│      │ Client        │      │          │      │ Receiver│      │ Output  │      │         │
+└─────────┘      └────────┘      └──────────────┘      └──────────┘      └────────┘      └─────────┘
+```
+
+This allows ingesting broadcast feeds (SDI) via MOQT and/or sending MOQT feeds to broadcasters via SDI.
+
+## Performance Tuning
+
+### Latency vs. Reliability
+
+Adjust the dejitter buffer:
+
+```bash
+# Lower latency (100ms) - may have jitter
+moqflvreceiverclient --dejitter_buffer_size_ms 100 ...
+
+# Higher reliability (500ms) - smoother playback
+moqflvreceiverclient --dejitter_buffer_size_ms 500 ...
+```
+
+### Using FETCH for VOD
+
+For on-demand content, use FETCH mode:
+
+```bash
+moqflvreceiverclient --fetch \
+  --flv_outpath ~/Movies/vod.flv \
+  --logging DBG1
+```
+
+## Key Concepts Demonstrated
+
+<AccordionGroup>
+  <Accordion title="MoQMi Media Format">
+    Implements the [draft-cenzano-moq-media-interop](https://datatracker.ietf.org/doc/draft-cenzano-moq-media-interop/) specification for packaging media over MOQT.
+
+    Each media frame becomes a MOQT object with:
+    - Group ID = GOP number
+    - Object ID = Frame number within GOP
+    - Payload = MoQMi-packaged frame data
+  </Accordion>
+
+  <Accordion title="FFmpeg Integration">
+    Shows how to integrate MOQT with standard media tools:
+    - Use FIFO pipes for streaming data
+    - `-re` flag for real-time streaming
+    - FLV format for low-latency compatibility
+  </Accordion>
+
+  <Accordion title="Separate Video/Audio Tracks">
+    Video and audio are published as separate tracks:
+    - `flvstreamer/video0`
+    - `flvstreamer/audio0`
+
+    This allows independent quality/latency control per media type.
+  </Accordion>
+
+  <Accordion title="Dejitter Buffer">
+    The receiver includes a dejitter buffer to smooth out network jitter:
+    ```cpp
+    DEFINE_int32(
+        dejitter_buffer_size_ms,
+        300,
+        "Dejitter buffer size in ms (this translates to added latency)");
+    ```
+
+    This trades latency for playback smoothness.
+  </Accordion>
+</AccordionGroup>
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="No video/audio received">
+    Verify track names match between streamer and receiver:
+    ```bash
+    # Streamer
+    --video_track_name "video0" --audio_track_name "audio0"
+
+    # Receiver (must match)
+    --video_track_name "video0" --audio_track_name "audio0"
+    ```
+  </Accordion>
+
+  <Accordion title="FIFO pipe hangs">
+    FIFOs require both reader and writer to be running. Start the reader (receiver/player) **before** the writer (streamer/FFmpeg).
+  </Accordion>
+
+  <Accordion title="Playback stuttering">
+    Increase the dejitter buffer:
+    ```bash
+    --dejitter_buffer_size_ms 500
+    ```
+  </Accordion>
+
+  <Accordion title="Unsupported codec error">
+    Only H.264 video and AAC-LC audio are supported. Verify with:
+    ```bash
+    ffprobe input.flv
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="MoQMi Specification" icon="file" href="https://datatracker.ietf.org/doc/draft-cenzano-moq-media-interop/">
+    Learn about the media interop format
+  </Card>
+  <Card title="moq-encoder-player" icon="browser" href="https://github.com/facebookexperimental/moq-encoder-player">
+    Browser-based encoder and player
+  </Card>
+</CardGroup>

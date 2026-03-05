@@ -1,0 +1,290 @@
+---
+title: MoQRelaySession
+description: Extended session class with full namespace publishing support
+---
+
+## Overview
+
+`MoQRelaySession` extends `MoQSession` with full namespace publishing functionality. While the base `MoQSession` returns `NOT_SUPPORTED` for namespace operations (suitable for simple clients), `MoQRelaySession` provides real implementations of namespace management methods.
+
+**Header:** `moxygen/MoQRelaySession.h`
+
+### Key Features
+
+- **Namespace Publishing**: Full `publishNamespace()` implementation
+- **Namespace Subscription**: Full `subscribeNamespace()` implementation
+- **State Management**: Tracks namespace handles and callbacks
+- **Relay Support**: Designed for relay servers and multi-hop scenarios
+- **Backward Compatible**: All `MoQSession` functionality remains available
+
+### Inheritance
+
+```cpp
+class MoQRelaySession : public MoQSession
+```
+
+Inherits all constructors and methods from `MoQSession`.
+
+## Use Cases
+
+- **Relay Servers**: Forward namespace availability between publishers and subscribers
+- **Dynamic Track Discovery**: Applications that need to discover and announce tracks dynamically
+- **Multi-Hop Delivery**: Scenarios where content passes through multiple intermediaries
+- **Namespace Aggregation**: Combining multiple namespace sources
+
+## Additional Methods
+
+### publishNamespace
+
+```cpp
+folly::coro::Task<Subscriber::PublishNamespaceResult> publishNamespace(
+    PublishNamespace ann,
+    std::shared_ptr<PublishNamespaceCallback> publishNamespaceCallback = nullptr
+) override;
+```
+
+Publishes availability of a track namespace to subscribers. This announces that tracks within the specified namespace can be subscribed to.
+
+<ParamField path="ann" type="PublishNamespace" required>
+  Namespace publish request containing:
+  - `requestID`: Unique identifier for this request
+  - `trackNamespace`: Namespace tuple (e.g., `{"conference", "room-1"}`)
+  - `params`: Optional parameters for authentication or metadata
+</ParamField>
+
+<ParamField path="publishNamespaceCallback" type="std::shared_ptr<PublishNamespaceCallback>">
+  Optional callback to receive `publishNamespaceCancel()` notifications from the peer
+</ParamField>
+
+<ResponseField name="PublishNamespaceResult" type="folly::Expected<std::shared_ptr<PublishNamespaceHandle>, PublishNamespaceError>">
+  On success, returns a `PublishNamespaceHandle` to manage the announcement lifecycle. On failure, returns `PublishNamespaceError`.
+</ResponseField>
+
+**Usage:**
+
+```cpp
+PublishNamespace publishNs;
+publishNs.requestID = getNextRequestID();
+publishNs.trackNamespace = {"conference", "room-1"};
+
+class MyCallback : public PublishNamespaceCallback {
+  void publishNamespaceCancel(
+      PublishNamespaceErrorCode errorCode,
+      std::string reasonPhrase) override {
+    XLOG(INFO) << "Namespace cancelled: " << reasonPhrase;
+  }
+};
+
+auto callback = std::make_shared<MyCallback>();
+auto result = co_await session->publishNamespace(std::move(publishNs), callback);
+
+if (result.hasValue()) {
+  auto handle = result.value();
+  // Namespace is now published
+  
+  // Later, signal completion
+  handle->publishNamespaceDone();
+}
+```
+
+### subscribeNamespace
+
+```cpp
+folly::coro::Task<Publisher::SubscribeNamespaceResult> subscribeNamespace(
+    SubscribeNamespace subAnn,
+    std::shared_ptr<NamespacePublishHandle> namespacePublishHandle
+) override;
+```
+
+Subscribes to a namespace prefix to receive notifications when new tracks are published.
+
+<ParamField path="subAnn" type="SubscribeNamespace" required>
+  Namespace subscription request containing:
+  - `requestID`: Unique identifier for this request
+  - `trackNamespacePrefix`: Namespace prefix to subscribe to (e.g., `{"conference"}`)
+  - `params`: Optional parameters for filtering or authentication
+</ParamField>
+
+<ParamField path="namespacePublishHandle" type="std::shared_ptr<NamespacePublishHandle>" required>
+  Handle that will receive namespace availability notifications via:
+  - `namespaceMsg()`: Called when a new namespace is published
+  - `namespaceDoneMsg()`: Called when a namespace is no longer available
+</ParamField>
+
+<ResponseField name="SubscribeNamespaceResult" type="folly::Expected<std::shared_ptr<SubscribeNamespaceHandle>, SubscribeNamespaceError>">
+  On success, returns a `SubscribeNamespaceHandle` to manage the subscription. On failure, returns `SubscribeNamespaceError`.
+</ResponseField>
+
+**Usage:**
+
+```cpp
+SubscribeNamespace subNs;
+subNs.requestID = getNextRequestID();
+subNs.trackNamespacePrefix = {"conference"};
+
+class MyNamespaceHandle : public Publisher::NamespacePublishHandle {
+  void namespaceMsg(const TrackNamespace& trackNamespaceSuffix) override {
+    XLOG(INFO) << "New namespace available: " << trackNamespaceSuffix;
+    // Application can now subscribe to tracks in this namespace
+  }
+  
+  void namespaceDoneMsg(const TrackNamespace& trackNamespaceSuffix) override {
+    XLOG(INFO) << "Namespace no longer available: " << trackNamespaceSuffix;
+  }
+};
+
+auto handle = std::make_shared<MyNamespaceHandle>();
+auto result = co_await session->subscribeNamespace(std::move(subNs), handle);
+
+if (result.hasValue()) {
+  auto subHandle = result.value();
+  // Namespace subscription is active
+  
+  // Later, unsubscribe
+  subHandle->unsubscribeNamespace();
+}
+```
+
+## Factory Method
+
+### createRelaySessionFactory
+
+```cpp
+static std::function<std::shared_ptr<MoQSession>(
+    folly::MaybeManagedPtr<proxygen::WebTransport>,
+    std::shared_ptr<MoQExecutor>)>
+createRelaySessionFactory();
+```
+
+Creates a factory function that constructs `MoQRelaySession` instances. Useful for configuring clients and servers to use relay sessions.
+
+<ResponseField name="factory" type="std::function<std::shared_ptr<MoQSession>(...)>">
+  Factory function that creates `MoQRelaySession` instances
+</ResponseField>
+
+**Usage:**
+
+```cpp
+// Configure client to use relay sessions
+auto client = std::make_unique<MoQClient>();
+client->setSessionFactory(MoQRelaySession::createRelaySessionFactory());
+
+// Now all created sessions will be MoQRelaySession instances
+auto session = co_await client->setupMoQSession(url);
+```
+
+## Namespace State Management
+
+`MoQRelaySession` maintains internal state for namespace operations:
+
+### Publisher State
+
+For each published namespace, the session tracks:
+- **Request ID**: Unique identifier
+- **Namespace**: The published namespace tuple
+- **Handle**: `PublishNamespaceHandle` for lifecycle management
+- **Callback**: Optional callback for cancel notifications
+
+### Subscriber State
+
+For each namespace subscription, the session tracks:
+- **Request ID**: Unique identifier
+- **Namespace Prefix**: The subscribed prefix
+- **Handle**: `SubscribeNamespaceHandle` for unsubscribe operations
+- **Publish Handle**: Receives namespace availability messages
+
+### Legacy Support
+
+The implementation includes legacy translation maps for older protocol versions:
+- `legacyPublisherNamespaceToReqId_`: v15- publisher side
+- `legacySubscriberNamespaceToReqId_`: v15- subscriber side
+- `legacySubscribeNamespaceToReqId_`: v14- namespace subscriptions
+
+## Example: Relay Server
+
+```cpp
+// Create relay session
+auto wt = /* obtain WebTransport */;
+auto exec = std::make_shared<MoQExecutor>();
+auto session = std::make_shared<MoQRelaySession>(wt, exec);
+
+// Set handlers
+session->setPublishHandler(relayPublisher);
+session->setSubscribeHandler(relaySubscriber);
+
+// Start session
+session->start();
+
+// Setup
+ClientSetup clientSetup{.supportedVersions = {kVersionDraft07}};
+auto serverSetup = co_await session->setup(std::move(clientSetup));
+
+// Subscribe to upstream namespaces
+SubscribeNamespace subNs;
+subNs.trackNamespacePrefix = {"live"};
+
+class RelayNamespaceHandle : public Publisher::NamespacePublishHandle {
+  MoQRelaySession* downstreamSession_;
+  
+  void namespaceMsg(const TrackNamespace& ns) override {
+    // Forward namespace to downstream clients
+    PublishNamespace publishNs;
+    publishNs.trackNamespace = ns;
+    co_await downstreamSession_->publishNamespace(std::move(publishNs));
+  }
+};
+
+auto handle = std::make_shared<RelayNamespaceHandle>(downstreamSession);
+co_await session->subscribeNamespace(std::move(subNs), handle);
+```
+
+## Example: Dynamic Track Discovery
+
+```cpp
+// Publisher announces available namespaces
+PublishNamespace publishNs;
+publishNs.requestID = getNextRequestID();
+publishNs.trackNamespace = {"sports", "soccer", "game-123"};
+
+auto result = co_await publisherSession->publishNamespace(std::move(publishNs));
+if (result.hasValue()) {
+  // Now subscribers can discover and subscribe to tracks
+  // within sports/soccer/game-123/*
+}
+
+// Subscriber discovers namespaces
+SubscribeNamespace subNs;
+subNs.trackNamespacePrefix = {"sports"};
+
+class DiscoveryHandle : public Publisher::NamespacePublishHandle {
+  void namespaceMsg(const TrackNamespace& ns) override {
+    // Received: ["soccer", "game-123"]
+    // Full namespace: ["sports", "soccer", "game-123"]
+    
+    // Now subscribe to specific tracks
+    SubscribeRequest subReq;
+    subReq.trackNamespace = joinNamespace({"sports"}, ns);
+    subReq.trackName = "video";
+    co_await session->subscribe(std::move(subReq), consumer);
+  }
+};
+```
+
+## Comparison with MoQSession
+
+| Feature | MoQSession | MoQRelaySession |
+|---------|------------|------------------|
+| Subscribe to tracks | ✓ | ✓ |
+| Publish tracks | ✓ | ✓ |
+| Fetch objects | ✓ | ✓ |
+| publishNamespace() | Returns NOT_SUPPORTED | Full implementation |
+| subscribeNamespace() | Returns NOT_SUPPORTED | Full implementation |
+| Namespace state tracking | ✗ | ✓ |
+| Use case | Simple clients | Relays, discovery |
+
+## Related Classes
+
+- [MoQSession](/api/moq-session) - Base session class
+- [Publisher](/api/publisher) - Publisher interface with `SubscribeNamespaceHandle`
+- [Subscriber](/api/subscriber) - Subscriber interface with `PublishNamespaceHandle`
+- [MoQRelay](/guides/relay-server) - Relay implementation using `MoQRelaySession`

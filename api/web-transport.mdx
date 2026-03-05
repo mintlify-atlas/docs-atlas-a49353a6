@@ -1,0 +1,422 @@
+---
+title: WebTransport Abstraction
+description: Transport layer abstraction for MOQT protocol over QUIC
+---
+
+## Overview
+
+The WebTransport abstraction layer decouples the MOQT protocol implementation from the underlying transport mechanism. This design enables Moxygen to support multiple QUIC implementations and transport modes while maintaining a consistent API.
+
+**Key Headers:**
+- `proxygen/lib/http/webtransport/WebTransport.h` - WebTransport interface
+- `proxygen/lib/http/webtransport/QuicWebTransport.h` - Native QUIC wrapper
+- `proxygen/lib/http/webtransport/HTTPWebTransport.h` - HTTP/3 WebTransport
+
+**Namespace:** `proxygen`
+
+## Transport Abstraction
+
+### WebTransport Interface
+
+The core `proxygen::WebTransport` interface provides:
+
+```cpp
+class WebTransport {
+ public:
+  // Stream creation
+  virtual BidiStreamHandle createBidiStream() = 0;
+  virtual StreamWriteHandle* createUniStream() = 0;
+  
+  // Datagram support
+  virtual void sendDatagram(std::unique_ptr<folly::IOBuf> datagram) = 0;
+  
+  // Session management
+  virtual void closeSession(std::optional<uint32_t> error = std::nullopt) = 0;
+  virtual void drain() = 0;
+  
+  // Handler registration
+  virtual void setHandler(WebTransportHandler* handler) = 0;
+};
+```
+
+### WebTransportHandler Callbacks
+
+```cpp
+class WebTransportHandler {
+ public:
+  virtual void onNewBidiStream(BidiStreamHandle handle) noexcept = 0;
+  virtual void onNewUniStream(StreamReadHandle* handle) noexcept = 0;
+  virtual void onDatagram(std::unique_ptr<folly::IOBuf> datagram) noexcept = 0;
+  virtual void onSessionEnd(folly::Optional<uint32_t> error) noexcept = 0;
+  virtual void onSessionDrain() noexcept = 0;
+};
+```
+
+## Transport Implementations
+
+### HTTP/3 WebTransport
+
+**Use Case:** Standard WebTransport over HTTP/3 as defined in the WebTransport specification.
+
+**Features:**
+- Full HTTP/3 integration
+- CONNECT protocol upgrade
+- Browser compatibility
+- Per-stream and connection flow control
+- Capsule protocol support
+
+**How it works:**
+1. Client establishes HTTP/3 connection
+2. Client sends CONNECT request with `protocol: webtransport`
+3. Server responds with 200 OK
+4. WebTransport session established over HTTP/3 stream
+
+**Usage in Moxygen:**
+```cpp
+// Client side (MoQWebTransportClient)
+auto httpClient = std::make_shared<proxygen::HTTPClient>();
+auto wt = httpClient->connectWebTransport(url);
+auto session = std::make_shared<MoQSession>(wt, executor);
+
+// Server side (MoQServer)
+void Handler::onHeadersComplete(std::unique_ptr<HTTPMessage> req) {
+  if (req->getMethod() == HTTPMethod::CONNECT &&
+      req->getUpgradeProtocol() == "webtransport") {
+    // Accept WebTransport
+    HTTPMessage resp;
+    resp.setStatusCode(200);
+    txn_->sendHeaders(resp);
+    
+    auto wt = txn_->getWebTransport();
+    auto session = createSession(wt, executor);
+  }
+}
+```
+
+### Native QUIC via QuicWebTransport
+
+**Use Case:** Direct QUIC transport without HTTP/3 layer, using MOQT ALPNs.
+
+**Features:**
+- Lower overhead (no HTTP/3 layer)
+- Direct QUIC stream and datagram access
+- Custom ALPN negotiation
+- Better performance for pure MOQT scenarios
+
+**How it works:**
+1. Client establishes QUIC connection with MOQT ALPN (e.g., `"moq-00"`)
+2. `QuicWebTransport` wraps the QUIC socket
+3. Provides WebTransport interface over native QUIC streams
+
+**Usage in Moxygen:**
+```cpp
+// Client side (MoQClient)
+auto quicClient = co_await connectQuic(
+    connectAddr,
+    timeoutMs,
+    verifier,
+    {"moq-00"},  // MOQT ALPN
+    transportSettings);
+
+auto quicWebTransport = 
+    std::make_shared<proxygen::QuicWebTransport>(std::move(quicClient));
+auto session = std::make_shared<MoQSession>(
+    folly::MaybeManagedPtr<WebTransport>(quicWebTransport),
+    executor);
+
+// Server side (MoQServer)
+void createMoQQuicSession(std::shared_ptr<quic::QuicSocket> quicSocket) {
+  auto quicWebTransport = 
+      std::make_shared<proxygen::QuicWebTransport>(std::move(quicSocket));
+  auto session = createSession(
+      folly::MaybeManagedPtr<WebTransport>(quicWebTransport),
+      executor);
+  quicWebTransport->setHandler(session.get());
+}
+```
+
+## Stream Management
+
+### Bidirectional Streams
+
+Bidirectional streams support both reading and writing:
+
+```cpp
+// Create bidirectional stream
+auto handle = webTransport->createBidiStream();
+auto writeHandle = handle.writeHandle;
+auto readHandle = handle.readHandle;
+
+// Write data
+writeHandle->writeChain(
+    folly::IOBuf::copyBuffer("Hello"),
+    /*eof=*/false);
+
+// Read data
+readHandle->setReadCallback(myCallback);
+
+// Close stream
+writeHandle->writeChain(nullptr, /*eof=*/true);
+```
+
+### Unidirectional Streams
+
+Unidirectional streams are write-only (outgoing) or read-only (incoming):
+
+```cpp
+// Create unidirectional stream (write-only)
+auto writeHandle = webTransport->createUniStream();
+writeHandle->writeChain(
+    folly::IOBuf::copyBuffer("Data"),
+    /*eof=*/true);
+
+// Handle incoming unidirectional stream (read-only)
+void onNewUniStream(StreamReadHandle* readHandle) override {
+  readHandle->setReadCallback(myCallback);
+}
+```
+
+### Stream Callbacks
+
+```cpp
+class MyStreamCallback : public WebTransport::StreamReadCallback {
+ public:
+  void readAvailable(StreamReadHandle* handle) noexcept override {
+    auto data = handle->read();
+    if (data) {
+      processData(std::move(data));
+    }
+  }
+  
+  void readEOF(StreamReadHandle* handle) noexcept override {
+    XLOG(INFO) << "Stream ended";
+  }
+  
+  void readError(
+      StreamReadHandle* handle,
+      const std::exception& ex) noexcept override {
+    XLOG(ERR) << "Stream error: " << ex.what();
+  }
+};
+```
+
+## Datagrams
+
+Datagrams provide unreliable, unordered message delivery:
+
+```cpp
+// Send datagram
+auto payload = folly::IOBuf::copyBuffer("Unreliable message");
+webTransport->sendDatagram(std::move(payload));
+
+// Receive datagram
+void onDatagram(std::unique_ptr<folly::IOBuf> datagram) noexcept override {
+  auto data = datagram->moveToFbString();
+  XLOG(INFO) << "Received datagram: " << data;
+}
+```
+
+**Characteristics:**
+- Not guaranteed delivery
+- Not guaranteed ordering
+- Lower latency than streams
+- Size limited by QUIC datagram size limit
+
+**Use cases in MOQT:**
+- Low-latency object delivery
+- Time-sensitive data where loss is acceptable
+- Small objects (< MTU size)
+
+## Flow Control
+
+### Connection-Level Flow Control
+
+```cpp
+// Check connection flow control state
+if (client->getConnectionFlowControl().hasValue()) {
+  auto fc = client->getConnectionFlowControl().value();
+  XLOG(INFO) << "Send window: " << fc.sendWindowAvailable;
+  XLOG(INFO) << "Receive window: " << fc.receiveWindowAvailable;
+}
+```
+
+### Stream-Level Flow Control
+
+Flow control is automatic at the stream level, but you can monitor it:
+
+```cpp
+void onStreamWritable(StreamWriteHandle* handle) noexcept override {
+  // Stream has available flow control credit
+  sendMoreData(handle);
+}
+
+void onStreamBlocked(StreamWriteHandle* handle) noexcept override {
+  // Stream is blocked on flow control
+  waitForCredit();
+}
+```
+
+### Backpressure in MOQT
+
+MOQT implements application-level backpressure on top of transport flow control:
+
+```cpp
+// Wait for stream credit before sending
+co_await consumer->awaitStreamCredit();
+
+// For fetch operations
+auto result = co_await fetchConsumer->awaitReadyToConsume();
+if (result.hasError()) {
+  if (result.error() == MoQPublishError::BLOCKED) {
+    // Consumer is blocked, slow down
+  }
+}
+```
+
+## When to Use Each Transport
+
+### Use HTTP/3 WebTransport When:
+
+- Need browser compatibility
+- Deploying in environments with HTTP/3 infrastructure
+- Want standard WebTransport semantics
+- Interoperating with other WebTransport implementations
+- Using shared HTTP/3 server infrastructure
+
+**Example:** Public relay servers, browser-based clients, CDN integration
+
+### Use Native QUIC When:
+
+- Building native applications (C++, mobile)
+- Need maximum performance and lowest overhead
+- Don't require HTTP/3 features
+- Want fine-grained QUIC control
+- Implementing custom MOQT applications
+
+**Example:** Native streaming applications, server-to-server relay, mobile apps
+
+## Transport Configuration
+
+### Choosing Transport in Client
+
+```cpp
+// HTTP/3 WebTransport client
+auto webTransportClient = std::make_unique<MoQWebTransportClient>(
+    executor,
+    proxygen::URL("https://relay.example.com/moq"));
+
+// Native QUIC client
+auto quicClient = std::make_unique<MoQClient>(
+    executor,
+    proxygen::URL("https://relay.example.com/moq"));
+
+// Helper function to choose
+auto client = makeMoQClient(
+    executor,
+    url,
+    /*useQuic=*/true  // true for native QUIC, false for WebTransport
+);
+```
+
+### Server-Side Transport Support
+
+`MoQServer` automatically supports both transports:
+
+```cpp
+auto server = std::make_shared<MoQServer>(
+    "cert.pem",
+    "key.pem",
+    "/moq");  // WebTransport endpoint
+
+// Server accepts:
+// 1. HTTP/3 WebTransport connections to /moq
+// 2. Direct QUIC connections with MOQT ALPNs
+
+server->start(folly::SocketAddress("0.0.0.0", 4433));
+```
+
+## ALPN Configuration
+
+Application-Layer Protocol Negotiation (ALPN) determines the transport mode:
+
+```cpp
+// HTTP/3 WebTransport uses "h3" ALPN
+std::vector<std::string> h3Alpns = {"h3"};
+
+// Native QUIC uses MOQT-specific ALPNs
+std::vector<std::string> moqtAlpns = {
+    "moq-00",   // Draft version 00
+    "moq-01",   // Draft version 01
+    "moq-14",   // Draft version 14
+};
+
+// Server supports both
+std::vector<std::string> allAlpns = {"h3", "moq-00", "moq-01"};
+auto fizzContext = createFizzServerContext(allAlpns, ...);
+```
+
+## Performance Considerations
+
+### HTTP/3 WebTransport Overhead
+
+- Additional HTTP/3 framing
+- CONNECT request/response overhead
+- Capsule protocol encapsulation
+- Estimated overhead: ~100-200 bytes per connection + per-message framing
+
+### Native QUIC Advantages
+
+- Direct stream mapping (no HTTP/3 layer)
+- Lower CPU usage (fewer protocol layers)
+- Reduced memory footprint
+- Better for high-throughput scenarios
+
+### Recommendation
+
+For pure MOQT applications without browser requirements, native QUIC typically provides 5-10% better throughput and lower latency.
+
+## Transport Information
+
+```cpp
+// Get transport metrics
+if (auto info = client->getTransportInfo()) {
+  XLOG(INFO) << "RTT: " << info->srtt.count() << "us";
+  XLOG(INFO) << "Congestion window: " << info->cwnd_bytes;
+  XLOG(INFO) << "Bytes in flight: " << info->bytes_in_flight;
+  XLOG(INFO) << "Packets sent: " << info->packet_sent;
+  XLOG(INFO) << "Packets lost: " << info->total_packets_lost;
+}
+```
+
+## Error Handling
+
+### Connection Errors
+
+```cpp
+void onSessionEnd(folly::Optional<uint32_t> error) noexcept override {
+  if (error) {
+    XLOG(ERR) << "Session ended with error: " << *error;
+  } else {
+    XLOG(INFO) << "Session ended gracefully";
+  }
+}
+```
+
+### Stream Errors
+
+```cpp
+void readError(
+    StreamReadHandle* handle,
+    const std::exception& ex) noexcept override {
+  XLOG(ERR) << "Stream error: " << ex.what();
+  // Handle stream-specific error
+}
+```
+
+## See Also
+
+- [MoQClient](/api/moq-client) - Native QUIC client
+- [MoQWebTransportClient](/api/moq-web-transport-client) - HTTP/3 WebTransport client
+- [MoQServer](/api/moq-server) - Server supporting both transports
+- [MoQSession](/api/moq-session) - Transport-agnostic session layer
+- [ARCHITECTURE.md](https://github.com/facebookexperimental/moxygen/blob/main/source/ARCHITECTURE.md) - Detailed architecture documentation

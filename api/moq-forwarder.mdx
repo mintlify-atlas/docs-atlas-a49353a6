@@ -1,0 +1,290 @@
+---
+title: "MoQForwarder"
+description: "Reusable component for fan-out data forwarding to multiple subscribers"
+---
+
+## Overview
+
+`MoQForwarder` is a reusable component that implements `TrackConsumer` to receive data from upstream and forwards it to multiple downstream subscribers. It handles per-subscriber filtering, backpressure, and graceful lifecycle management.
+
+**Source**: `moxygen/relay/MoQForwarder.h`
+
+## Key Features
+
+<CardGroup cols={2}>
+  <Card title="Multi-Subscriber" icon="users">
+    Fan-out to multiple downstream subscribers simultaneously
+  </Card>
+  <Card title="Per-Subscriber Filtering" icon="filter">
+    Respects each subscriber's range and forward preference
+  </Card>
+  <Card title="Payload Cloning" icon="clone">
+    Efficiently clones payload handles for multi-delivery
+  </Card>
+  <Card title="Backpressure" icon="gauge-high">
+    Handles per-subscriber errors and flow control
+  </Card>
+</CardGroup>
+
+## Constructor
+
+```cpp MoQForwarder.h
+explicit MoQForwarder(
+    FullTrackName ftn,
+    std::optional<AbsoluteLocation> largest = std::nullopt);
+```
+
+<ParamField path="ftn" type="FullTrackName">
+  The full track name (namespace + track name)
+</ParamField>
+
+<ParamField path="largest" type="std::optional<AbsoluteLocation>">
+  Optional initial largest location
+</ParamField>
+
+## Managing Subscribers
+
+### addSubscriber
+
+Adds a subscriber to receive forwarded data.
+
+```cpp
+std::shared_ptr<MoQForwarder::Subscriber> addSubscriber(
+    std::shared_ptr<MoQSession> session,
+    const SubscribeRequest& subReq,
+    std::shared_ptr<TrackConsumer> consumer);
+```
+
+<ParamField path="session" type="std::shared_ptr<MoQSession>">
+  The subscriber's session
+</ParamField>
+
+<ParamField path="subReq" type="const SubscribeRequest&">
+  The subscription request containing range and preferences
+</ParamField>
+
+<ParamField path="consumer" type="std::shared_ptr<TrackConsumer>">
+  Consumer to receive forwarded objects
+</ParamField>
+
+<ResponseField name="return" type="std::shared_ptr<Subscriber>">
+  Handle for managing this subscriber
+</ResponseField>
+
+### removeSubscriber
+
+Immediately removes a subscriber and resets all open subgroups.
+
+```cpp
+void removeSubscriber(
+    const std::shared_ptr<MoQSession>& session,
+    std::optional<PublishDone> pubDone,
+    const std::string& callsite);
+```
+
+### drainSubscriber
+
+Gracefully drains a subscriber by forwarding `publishDone` without resetting subgroups.
+
+```cpp
+void drainSubscriber(
+    const std::shared_ptr<MoQSession>& session,
+    PublishDone pubDone,
+    const std::string& callsite);
+```
+
+## TrackConsumer Implementation
+
+The forwarder implements all `TrackConsumer` methods to receive data:
+
+### setTrackAlias
+
+```cpp
+folly::Expected<folly::Unit, MoQPublishError> setTrackAlias(
+    TrackAlias alias) override;
+```
+
+Sets the track alias and propagates to all subscribers.
+
+### beginSubgroup
+
+```cpp
+folly::Expected<std::shared_ptr<SubgroupConsumer>, MoQPublishError>
+beginSubgroup(
+    uint64_t groupID,
+    uint64_t subgroupID,
+    Priority priority,
+    bool containsLastInGroup = false) override;
+```
+
+Creates a `SubgroupForwarder` that will fan-out objects to all matching subscribers.
+
+### objectStream
+
+```cpp
+folly::Expected<folly::Unit, MoQPublishError> objectStream(
+    const ObjectHeader& header,
+    Payload payload,
+    bool lastInGroup = false) override;
+```
+
+Forwards a complete object on its own stream to all subscribers in range.
+
+### datagram
+
+```cpp
+folly::Expected<folly::Unit, MoQPublishError> datagram(
+    const ObjectHeader& header,
+    Payload payload,
+    bool lastInGroup = false) override;
+```
+
+Forwards a datagram object to all subscribers in range.
+
+### publishDone
+
+```cpp
+folly::Expected<folly::Unit, MoQPublishError> publishDone(
+    PublishDone pubDone) override;
+```
+
+Signals end of track to all subscribers and invokes the `onEmpty` callback.
+
+## Subscriber Filtering
+
+Each subscriber has its own range and preferences:
+
+```cpp
+struct Subscriber : public Publisher::SubscriptionHandle {
+  std::shared_ptr<MoQSession> session;
+  RequestID requestID;
+  SubscribeRange range;              // Start/end locations
+  std::shared_ptr<TrackConsumer> trackConsumer;
+  bool shouldForward;                // Forward preference
+};
+```
+
+The forwarder checks `checkRange()` before delivering objects to each subscriber.
+
+## SubgroupForwarder
+
+For each active subgroup, a `SubgroupForwarder` is created:
+
+```cpp
+class SubgroupForwarder : public SubgroupConsumer {
+  folly::Expected<folly::Unit, MoQPublishError> object(
+      uint64_t objectID,
+      Payload payload,
+      Extensions extensions,
+      bool finSubgroup) override;
+  
+  folly::Expected<folly::Unit, MoQPublishError> beginObject(
+      uint64_t objectID,
+      uint64_t length,
+      Payload initialPayload,
+      Extensions extensions) override;
+  
+  folly::Expected<folly::Unit, MoQPublishError> endOfGroup(
+      uint64_t endOfGroupObjectID) override;
+  
+  folly::Expected<folly::Unit, MoQPublishError> endOfSubgroup() override;
+  
+  void reset(ResetStreamErrorCode error) override;
+};
+```
+
+## Callback Interface
+
+```cpp
+class Callback {
+ public:
+  virtual void onEmpty(MoQForwarder*) = 0;
+  virtual void forwardChanged(MoQForwarder*) {}
+};
+
+void setCallback(std::shared_ptr<Callback> callback);
+```
+
+<ParamField path="onEmpty" type="void">
+  Called when all subscribers have been removed
+</ParamField>
+
+<ParamField path="forwardChanged" type="void">
+  Called when the number of forwarding subscribers changes
+</ParamField>
+
+## Usage Example
+
+### In a Publisher
+
+```cpp publisher_with_forwarder.cpp
+#include <moxygen/relay/MoQForwarder.h>
+
+class MyPublisher : public Publisher {
+  folly::coro::Task<SubscribeResult> subscribe(
+      SubscribeRequest subReq,
+      std::shared_ptr<TrackConsumer> consumer) override {
+    
+    FullTrackName ftn{subReq.trackNamespace, subReq.trackName};
+    
+    // Get or create forwarder for this track
+    auto& forwarder = forwarders_[ftn];
+    if (!forwarder) {
+      forwarder = std::make_shared<MoQForwarder>(ftn);
+      forwarder->setCallback(shared_from_this());
+    }
+    
+    // Add this subscriber
+    auto sub = forwarder->addSubscriber(session, subReq, consumer);
+    
+    co_return std::shared_ptr<SubscriptionHandle>(std::move(sub));
+  }
+  
+  void publishData() {
+    auto forwarder = forwarders_.at(ftn);
+    
+    // Open subgroup
+    auto subgroup = forwarder->beginSubgroup(
+      groupID, subgroupID, priority).value();
+    
+    // Publish objects - forwarded to all subscribers
+    subgroup->object(objectID, std::move(payload), extensions, false);
+    subgroup->endOfSubgroup();
+  }
+  
+  void onEmpty(MoQForwarder* forwarder) override {
+    // All subscribers gone - clean up
+    forwarders_.erase(forwarder->fullTrackName());
+  }
+  
+  folly::F14FastMap<FullTrackName, std::shared_ptr<MoQForwarder>> forwarders_;
+};
+```
+
+## Error Handling
+
+The forwarder handles per-subscriber errors:
+
+- **Soft errors** (e.g., `CANCELLED`): Close the subgroup for that subscriber but keep subscription alive
+- **Hard errors** (e.g., session closed): Remove the entire subscription
+
+```cpp
+void removeSubscriberOnError(
+    const Subscriber& sub,
+    const MoQPublishError& err,
+    const std::string& callsite);
+```
+
+## Related Classes
+
+<CardGroup cols={3}>
+  <Card title="MoQRelay" href="/api/moq-relay">
+    Uses MoQForwarder internally
+  </Card>
+  <Card title="TrackConsumer" href="/api/track-consumer">
+    Interface implemented by forwarder
+  </Card>
+  <Card title="SubgroupConsumer" href="/api/subgroup-consumer">
+    SubgroupForwarder interface
+  </Card>
+</CardGroup>

@@ -1,0 +1,236 @@
+---
+title: Installation
+description: Build Moxygen and its dependencies from source
+---
+
+## System Requirements
+
+Before building Moxygen, ensure your system meets these requirements:
+
+### Supported Platforms
+
+- **Linux** (Ubuntu 20.04+, Fedora, CentOS)
+- **macOS** (10.15+)
+
+### Required Tools
+
+- **C++ Compiler** with C++20 support (GCC 10+, Clang 12+)
+- **CMake** 3.13 or later
+- **Python** 3.6+ (for build scripts)
+- **Git**
+
+<Note>
+Moxygen requires C++20 for coroutine support, which is essential to the library's async operations.
+</Note>
+
+## Dependencies
+
+Moxygen depends on several Meta open source libraries. The build system will automatically download and build these dependencies:
+
+<CardGroup cols={2}>
+  <Card title="folly" icon="book">
+    Facebook's foundational C++ library providing async primitives, data structures, and utilities
+  </Card>
+  
+  <Card title="fizz" icon="lock">
+    TLS 1.3 implementation used for secure QUIC connections
+  </Card>
+  
+  <Card title="mvfst" icon="network-wired">
+    Meta's QUIC transport implementation
+  </Card>
+  
+  <Card title="proxygen" icon="server">
+    HTTP library providing WebTransport support
+  </Card>
+</CardGroup>
+
+Additional dependencies:
+- **glog** - Logging library
+- **gflags** - Command-line flag parsing
+- **zstd** - Compression library
+
+<Warning>
+Do not try to install these dependencies manually. The build system uses `fbcode_builder/getdeps.py` to ensure compatible versions are built together.
+</Warning>
+
+## Building Moxygen
+
+<Steps>
+  <Step title="Clone the repository">
+    ```bash
+    git clone https://github.com/facebookexperimental/moxygen.git
+    cd moxygen
+    ```
+  </Step>
+
+  <Step title="Set up the build environment">
+    The `getdeps.py` script sets environment variables needed for the build:
+    
+    ```bash
+    eval $(./build/fbcode_builder/getdeps.py env --src-dir moxygen:. moxygen)
+    ```
+    
+    This configures paths so that Moxygen can find its dependencies during the build process.
+  </Step>
+
+  <Step title="Build Moxygen and dependencies">
+    This command will download and build all dependencies, then build Moxygen:
+    
+    ```bash
+    ./build/fbcode_builder/getdeps.py build moxygen
+    ```
+    
+    <Note>
+    The first build can take 30-60 minutes depending on your system, as it builds all dependencies from source. Subsequent builds will be much faster.
+    </Note>
+  </Step>
+
+  <Step title="Find the build output">
+    After a successful build, you can find the build directory:
+    
+    ```bash
+    MOXYGEN_BUILD_PATH=$(./build/fbcode_builder/getdeps.py show-build-dir moxygen)
+    echo $MOXYGEN_BUILD_PATH
+    ```
+    
+    The compiled binaries are located in this directory under `moxygen/`.
+  </Step>
+</Steps>
+
+## Rebuilding After Code Changes
+
+If you modify Moxygen source code, you can rebuild without rebuilding dependencies:
+
+<CodeGroup>
+```bash Full Rebuild
+# Rebuild Moxygen and its dependencies
+./build/fbcode_builder/getdeps.py build moxygen --src-dir=.
+```
+
+```bash Fast Rebuild (No Dependencies)
+# Only rebuild Moxygen, skip dependencies
+./build/fbcode_builder/getdeps.py build moxygen --src-dir=. --no-deps
+```
+</CodeGroup>
+
+The `--no-deps` flag is much faster when you're only changing Moxygen code.
+
+## Certificate Generation for Testing
+
+MOQT runs over QUIC, which requires TLS certificates. For local testing, generate self-signed certificates:
+
+<Steps>
+  <Step title="Navigate to scripts directory">
+    ```bash
+    cd scripts
+    ```
+  </Step>
+
+  <Step title="Generate certificates">
+    ```bash
+    ./create-server-certs.sh
+    ```
+    
+    This creates:
+    - `../certs/certificate.pem` - Self-signed certificate
+    - `../certs/certificate.key` - Private key
+  </Step>
+
+  <Step title="Return to project root">
+    ```bash
+    cd ..
+    ```
+  </Step>
+</Steps>
+
+<Warning>
+**Security Notice**: Self-signed certificates are for testing only. In production, use certificates from a trusted Certificate Authority.
+
+Clients connecting to servers with self-signed certificates must use the `--insecure` flag (similar to `curl -k`).
+</Warning>
+
+## Verifying the Installation
+
+Test your installation by building and running the date server sample:
+
+```bash
+# Set the build path
+MOXYGEN_BUILD_PATH=$(./build/fbcode_builder/getdeps.py show-build-dir moxygen)
+
+# Run the date server
+$MOXYGEN_BUILD_PATH/moxygen/samples/date/moqdateserver \
+  -port 4433 \
+  -cert ./certs/certificate.pem \
+  -key ./certs/certificate.key \
+  --logging DBG1
+```
+
+If the server starts without errors and prints log messages, your installation is working correctly. Press `Ctrl+C` to stop it.
+
+## Troubleshooting
+
+### Build Fails with C++20 Errors
+
+**Problem**: Compiler errors about coroutines or C++20 features
+
+**Solution**: Ensure your compiler supports C++20:
+
+```bash
+# Check GCC version (need 10+)
+gcc --version
+
+# Check Clang version (need 12+)  
+clang --version
+```
+
+### Python Module Not Found
+
+**Problem**: `getdeps.py` fails with import errors
+
+**Solution**: Ensure Python 3.6+ is installed:
+
+```bash
+python3 --version
+```
+
+### CMake Version Too Old
+
+**Problem**: Build fails with CMake version requirement errors
+
+**Solution**: Update CMake to 3.13 or later. On Ubuntu:
+
+```bash
+sudo apt-get update
+sudo apt-get install cmake
+```
+
+### Out of Memory During Build
+
+**Problem**: Build process is killed or system freezes
+
+**Solution**: Building all dependencies requires significant memory (8GB+ recommended). Try:
+
+- Close other applications
+- Add swap space
+- Build with fewer parallel jobs: Add `--num-jobs 2` to the build command
+
+### Certificate Generation Script Not Found
+
+**Problem**: `create-server-certs.sh` doesn't exist
+
+**Solution**: Check if you're in the `scripts/` directory:
+
+```bash
+ls -la scripts/create-server-certs.sh
+```
+
+If the script doesn't exist, you'll need to create certificates manually using OpenSSL.
+
+## Next Steps
+
+Now that Moxygen is built, proceed to the quick start guide:
+
+<Card title="Quick Start" icon="rocket" href="/quickstart">
+  Build and run your first MOQT application with the date server sample
+</Card>

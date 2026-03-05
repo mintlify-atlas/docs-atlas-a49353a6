@@ -1,0 +1,463 @@
+---
+title: MoQSession
+description: Core session class implementing the MOQT protocol
+---
+
+## Overview
+
+`MoQSession` is the primary class that implements the MOQT (Media over QUIC Transport) protocol. It serves as both a **Publisher** and **Subscriber**, enabling bidirectional communication for media streaming applications.
+
+**Header:** `moxygen/MoQSession.h`
+
+### Key Features
+
+- **Dual Role**: Implements both `Publisher` and `Subscriber` interfaces
+- **Transport Agnostic**: Operates over any `proxygen::WebTransport` implementation
+- **Extensible**: Applications set custom handlers via `setPublishHandler()` and `setSubscribeHandler()`
+- **Coroutine-Based**: Uses folly coroutines for async operations
+- **Version Negotiation**: Supports multiple MOQT protocol versions
+
+### Inheritance
+
+```cpp
+class MoQSession : public Subscriber,
+                   public Publisher,
+                   public MoQControlCodec::ControlCallback,
+                   public proxygen::WebTransportHandler
+```
+
+## Constructor
+
+### Client Constructor
+
+```cpp
+explicit MoQSession(
+    folly::MaybeManagedPtr<proxygen::WebTransport> wt,
+    std::shared_ptr<MoQExecutor> exec
+);
+```
+
+Creates a client-side MoQSession.
+
+<ParamField path="wt" type="folly::MaybeManagedPtr<proxygen::WebTransport>" required>
+  WebTransport instance providing the underlying QUIC transport
+</ParamField>
+
+<ParamField path="exec" type="std::shared_ptr<MoQExecutor>" required>
+  Executor for scheduling async operations and callbacks
+</ParamField>
+
+### Server Constructor
+
+```cpp
+explicit MoQSession(
+    folly::MaybeManagedPtr<proxygen::WebTransport> wt,
+    ServerSetupCallback& serverSetupCallback,
+    std::shared_ptr<MoQExecutor> exec
+);
+```
+
+Creates a server-side MoQSession with setup callback.
+
+<ParamField path="wt" type="folly::MaybeManagedPtr<proxygen::WebTransport>" required>
+  WebTransport instance providing the underlying QUIC transport
+</ParamField>
+
+<ParamField path="serverSetupCallback" type="ServerSetupCallback&" required>
+  Callback invoked during client setup for validation and configuration
+</ParamField>
+
+<ParamField path="exec" type="std::shared_ptr<MoQExecutor>" required>
+  Executor for scheduling async operations and callbacks
+</ParamField>
+
+## Core Methods
+
+### start
+
+```cpp
+void start();
+```
+
+Starts the session by initiating the control stream and beginning protocol operations. Must be called before any subscribe/publish operations.
+
+### setup
+
+```cpp
+folly::coro::Task<ServerSetup> setup(ClientSetup setup);
+```
+
+Performs the MOQT handshake by sending a `CLIENT_SETUP` message and awaiting the `SERVER_SETUP` response.
+
+<ParamField path="setup" type="ClientSetup" required>
+  Client setup parameters including supported versions and role
+</ParamField>
+
+<ResponseField name="ServerSetup" type="folly::coro::Task<ServerSetup>">
+  Server setup response containing negotiated version and parameters
+</ResponseField>
+
+**Usage:**
+
+```cpp
+ClientSetup clientSetup;
+clientSetup.supportedVersions = {kVersionDraft07};
+clientSetup.role = Role::BOTH;
+
+auto serverSetup = co_await session->setup(std::move(clientSetup));
+```
+
+## Publisher Methods
+
+These methods are inherited from the `Publisher` interface.
+
+### subscribe
+
+```cpp
+folly::coro::Task<SubscribeResult> subscribe(
+    SubscribeRequest sub,
+    std::shared_ptr<TrackConsumer> callback
+) override;
+```
+
+Sends a `SUBSCRIBE` request to the remote peer and awaits the response.
+
+<ParamField path="sub" type="SubscribeRequest" required>
+  Subscribe request containing track namespace, name, range, and parameters
+</ParamField>
+
+<ParamField path="callback" type="std::shared_ptr<TrackConsumer>" required>
+  Consumer that will receive objects for this subscription
+</ParamField>
+
+<ResponseField name="SubscribeResult" type="folly::Expected<std::shared_ptr<SubscriptionHandle>, SubscribeError>">
+  On success, returns a `SubscriptionHandle` for managing the subscription. On failure, returns `SubscribeError`.
+</ResponseField>
+
+**Usage:**
+
+```cpp
+SubscribeRequest subReq;
+subReq.trackNamespace = {"conference", "audio"};
+subReq.trackName = "main";
+subReq.priority = 128;
+
+auto consumer = std::make_shared<MyTrackConsumer>();
+auto result = co_await session->subscribe(std::move(subReq), consumer);
+
+if (result.hasValue()) {
+  auto handle = result.value();
+  // Use handle for unsubscribe or updates
+}
+```
+
+### fetch
+
+```cpp
+folly::coro::Task<FetchResult> fetch(
+    Fetch fetch,
+    std::shared_ptr<FetchConsumer> fetchy
+) override;
+```
+
+Sends a `FETCH` request to retrieve historical objects from the remote peer.
+
+<ParamField path="fetch" type="Fetch" required>
+  Fetch request specifying track, group/object range, and parameters
+</ParamField>
+
+<ParamField path="fetchy" type="std::shared_ptr<FetchConsumer>" required>
+  Consumer that will receive fetched objects
+</ParamField>
+
+<ResponseField name="FetchResult" type="folly::Expected<std::shared_ptr<FetchHandle>, FetchError>">
+  On success, returns a `FetchHandle` for managing the fetch. On failure, returns `FetchError`.
+</ResponseField>
+
+### trackStatus
+
+```cpp
+folly::coro::Task<TrackStatusResult> trackStatus(
+    TrackStatus trackStatus
+) override;
+```
+
+Sends a `TRACK_STATUS_REQUEST` to query the availability of a track.
+
+<ParamField path="trackStatus" type="TrackStatus" required>
+  Track status request containing namespace and name
+</ParamField>
+
+<ResponseField name="TrackStatusResult" type="folly::Expected<TrackStatusOk, TrackStatusError>">
+  On success, returns `TrackStatusOk` with track information. On failure, returns `TrackStatusError`.
+</ResponseField>
+
+## Subscriber Methods
+
+These methods are inherited from the `Subscriber` interface.
+
+### publish
+
+```cpp
+PublishResult publish(
+    PublishRequest pub,
+    std::shared_ptr<Publisher::SubscriptionHandle> handle = nullptr
+) override;
+```
+
+Initiates a `PUBLISH` request, allowing the local application to publish a track to the remote peer.
+
+<ParamField path="pub" type="PublishRequest" required>
+  Publish request containing track namespace, name, and parameters
+</ParamField>
+
+<ParamField path="handle" type="std::shared_ptr<Publisher::SubscriptionHandle>">
+  Optional subscription handle if this is a forwarded publish
+</ParamField>
+
+<ResponseField name="PublishResult" type="folly::Expected<PublishConsumerAndReplyTask, PublishError>">
+  On success, returns a `TrackConsumer` to write objects and an async reply task. On failure, returns `PublishError`.
+</ResponseField>
+
+**Usage:**
+
+```cpp
+PublishRequest pubReq;
+pubReq.trackNamespace = {"conference", "video"};
+pubReq.trackName = "camera-1";
+
+auto result = session->publish(std::move(pubReq));
+if (result.hasValue()) {
+  auto& [consumer, replyTask] = result.value();
+  
+  // Start publishing objects immediately
+  auto subgroup = consumer->beginSubgroup(groupId, subgroupId, priority);
+  subgroup->object(objectId, payload, extensions, false);
+  
+  // Await the PUBLISH_OK response
+  auto reply = co_await std::move(replyTask);
+}
+```
+
+## Configuration Methods
+
+### setVersion
+
+```cpp
+void setVersion(uint64_t version);
+```
+
+Sets the preferred MOQT protocol version.
+
+<ParamField path="version" type="uint64_t" required>
+  Protocol version number (e.g., `kVersionDraft07`)
+</ParamField>
+
+### setMoqSettings
+
+```cpp
+void setMoqSettings(MoQSettings settings);
+```
+
+Configures session settings including buffering thresholds and timeouts.
+
+<ParamField path="settings" type="MoQSettings" required>
+  Settings structure containing:
+  - `bufferingThresholds`: Per-subscription and per-session byte limits
+  - `setupTimeout`: Timeout for setup completion
+  - `versionNegotiationTimeout`: Timeout for version negotiation
+  - `unknownAliasTimeout`: Timeout for alias resolution
+  - `publishDoneStreamCountTimeout`: Timeout for in-flight streams on PUBLISH_DONE
+</ParamField>
+
+### setPublishHandler
+
+```cpp
+void setPublishHandler(std::shared_ptr<Publisher> publishHandler);
+```
+
+Sets a custom publisher to handle incoming subscription requests.
+
+<ParamField path="publishHandler" type="std::shared_ptr<Publisher>" required>
+  Publisher implementation that will handle `subscribe()` and `fetch()` calls
+</ParamField>
+
+### setSubscribeHandler
+
+```cpp
+void setSubscribeHandler(std::shared_ptr<Subscriber> subscribeHandler);
+```
+
+Sets a custom subscriber to handle incoming publish requests.
+
+<ParamField path="subscribeHandler" type="std::shared_ptr<Subscriber>" required>
+  Subscriber implementation that will handle `publish()` calls
+</ParamField>
+
+## Lifecycle Methods
+
+### drain
+
+```cpp
+void drain();
+```
+
+Initiates graceful shutdown by sending a `GOAWAY` message and stopping acceptance of new requests.
+
+### close
+
+```cpp
+void close(SessionCloseErrorCode error);
+```
+
+Closes the session immediately with the specified error code.
+
+<ParamField path="error" type="SessionCloseErrorCode" required>
+  Error code indicating the reason for closure (e.g., `NO_ERROR`, `INTERNAL_ERROR`)
+</ParamField>
+
+### goaway
+
+```cpp
+void goaway(Goaway goaway) override;
+```
+
+Sends a `GOAWAY` message to initiate graceful shutdown.
+
+<ParamField path="goaway" type="Goaway" required>
+  Goaway message containing the new URI for clients to connect to (optional)
+</ParamField>
+
+## Utility Methods
+
+### getNegotiatedVersion
+
+```cpp
+virtual std::optional<uint64_t> getNegotiatedVersion() const;
+```
+
+<ResponseField name="version" type="std::optional<uint64_t>">
+  The negotiated protocol version after setup, or `std::nullopt` if not yet negotiated
+</ResponseField>
+
+### getExecutor
+
+```cpp
+MoQExecutor* getExecutor() const;
+```
+
+<ResponseField name="executor" type="MoQExecutor*">
+  The executor associated with this session
+</ResponseField>
+
+### getPeerAddress
+
+```cpp
+folly::SocketAddress getPeerAddress() const;
+```
+
+<ResponseField name="address" type="folly::SocketAddress">
+  The remote peer's socket address
+</ResponseField>
+
+### getTransportInfo
+
+```cpp
+quic::TransportInfo getTransportInfo() const;
+```
+
+<ResponseField name="info" type="quic::TransportInfo">
+  Transport statistics including RTT, congestion window, and packet loss
+</ResponseField>
+
+### isClosed
+
+```cpp
+bool isClosed() const;
+```
+
+<ResponseField name="closed" type="bool">
+  Returns `true` if the session is closed
+</ResponseField>
+
+## Statistics
+
+### setPublisherStatsCallback
+
+```cpp
+void setPublisherStatsCallback(
+    std::shared_ptr<MoQPublisherStatsCallback> publisherStatsCallback
+);
+```
+
+Registers a callback to receive publisher statistics events.
+
+### setSubscriberStatsCallback
+
+```cpp
+void setSubscriberStatsCallback(
+    std::shared_ptr<MoQSubscriberStatsCallback> subscriberStatsCallback
+);
+```
+
+Registers a callback to receive subscriber statistics events.
+
+## Example Usage
+
+### Client Example
+
+```cpp
+// Create session
+auto wt = /* obtain WebTransport */;
+auto exec = std::make_shared<MoQExecutor>();
+auto session = std::make_shared<MoQSession>(wt, exec);
+
+// Configure
+session->setVersion(kVersionDraft07);
+
+// Start and setup
+session->start();
+ClientSetup clientSetup{.supportedVersions = {kVersionDraft07}};
+auto serverSetup = co_await session->setup(std::move(clientSetup));
+
+// Subscribe to a track
+SubscribeRequest subReq;
+subReq.trackNamespace = {"conference"};
+subReq.trackName = "audio";
+
+auto consumer = std::make_shared<MyTrackConsumer>();
+auto result = co_await session->subscribe(std::move(subReq), consumer);
+```
+
+### Server Example
+
+```cpp
+class MyServerSetup : public MoQSession::ServerSetupCallback {
+  folly::Try<ServerSetup> onClientSetup(
+      ClientSetup clientSetup,
+      const std::shared_ptr<MoQSession>& session) override {
+    ServerSetup serverSetup;
+    serverSetup.selectedVersion = kVersionDraft07;
+    return folly::Try<ServerSetup>(std::move(serverSetup));
+  }
+  
+  folly::Expected<folly::Unit, SessionCloseErrorCode> validateAuthority(
+      const ClientSetup& clientSetup,
+      uint64_t negotiatedVersion,
+      std::shared_ptr<MoQSession> session) override {
+    return folly::unit;
+  }
+};
+
+MyServerSetup setupCallback;
+auto session = std::make_shared<MoQSession>(wt, setupCallback, exec);
+session->setPublishHandler(myPublisher);
+session->start();
+```
+
+## Related Classes
+
+- [MoQRelaySession](/api/moq-relay-session) - Extended session with namespace support
+- [Publisher](/api/publisher) - Publisher interface for handling subscriptions
+- [Subscriber](/api/subscriber) - Subscriber interface for handling publishes
+- [TrackConsumer](/api/track-consumer) - Interface for receiving track objects

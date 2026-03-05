@@ -1,0 +1,359 @@
+---
+title: Media Streaming
+description: Stream video and audio using MoQFlvStreamerClient and MoQFlvReceiverClient
+---
+
+Moxygen provides ready-to-use media streaming clients for testing and prototyping with real video and audio content. The FLV-based streaming samples support H.264 video and AAC-LC audio using the MoqMi media packaging format.
+
+## Overview
+
+![MoQ Media Streaming Architecture](./pics/moq_streamer_receiver.png)
+
+The media streaming workflow consists of:
+- **MoQFlvStreamerClient**: Reads FLV files/streams, packages as MoqMi, publishes to relay
+- **MoQFlvReceiverClient**: Subscribes to tracks, demuxes MoqMi, outputs FLV
+- **Relay**: Routes media between publisher and subscribers
+- **ffmpeg**: Generates input and plays output
+
+<Note>
+Why FLV? It's streaming-friendly, simple, carries AVCDecoderRecord (used by MoqMi), and well-understood for rapid prototyping. Future support for fmp4 is planned.
+</Note>
+
+## Quick Start
+
+<Steps>
+
+### Step 1: Start the Relay
+
+```bash
+# Terminal 1
+$MOXYGEN_BUILD_PATH/moxygen/relay/moqrelayserver \
+  --cert ./certs/certificate.pem \
+  --key ./certs/certificate.key \
+  --endpoint "/moq" \
+  --port 4433
+```
+
+### Step 2: Generate Live Stream with ffmpeg
+
+```bash
+# Terminal 2 - Create FIFO and stream synthetic content
+mkfifo ~/Movies/fifo.flv
+
+ffmpeg -y -f lavfi -re \
+  -i smptebars=duration=300:size=320x200:rate=30 \
+  -f lavfi -re \
+  -i sine=frequency=1000:duration=300:sample_rate=48000 \
+  -pix_fmt yuv420p \
+  -c:v libx264 -b:v 180k -g 60 -keyint_min 60 \
+  -profile:v baseline -preset veryfast \
+  -c:a aac -b:a 96k \
+  -vf "drawtext=fontfile=/System/Library/Fonts/Helvetica.ttc: \
+       text='%{localtime\: %Y/%m/%d %H.%M.%S} (%{n})': \
+       x=10: y=10: fontsize=16: fontcolor=white: \
+       box=1: boxcolor=0x00000099" \
+  -f flv ~/Movies/fifo.flv
+```
+
+<Note>
+The `-re` flag is crucial - it plays at real-time speed (1x), simulating a live stream.
+</Note>
+
+### Step 3: Start the Streamer Client
+
+```bash
+# Terminal 3 - Connect publisher to relay
+$MOXYGEN_BUILD_PATH/moxygen/samples/flv_streamer_client/moqflvstreamerclient \
+  --insecure \
+  --input_flv_file ~/Movies/fifo.flv \
+  --track_namespace flvstreamer \
+  --video_track_name video0 \
+  --audio_track_name audio0
+```
+
+### Step 4: Receive and Save Stream
+
+```bash
+# Terminal 4 - Subscribe and save to file
+$MOXYGEN_BUILD_PATH/moxygen/samples/flv_receiver_client/moqflvreceiverclient \
+  --insecure \
+  --flv_outpath ~/Movies/my-moq-out.flv \
+  --track_namespace flvstreamer \
+  --video_track_name video0 \
+  --audio_track_name audio0
+```
+
+</Steps>
+
+## Live Playback
+
+To watch the stream in real-time:
+
+<Steps>
+
+### Create Output FIFO
+
+```bash
+# Terminal 4
+mkfifo ~/Movies/fifo-out.flv
+```
+
+### Start ffplay
+
+```bash
+# Terminal 4 (or 5 if you want both)
+ffplay ~/Movies/fifo-out.flv
+```
+
+### Start Receiver
+
+```bash
+# Terminal 5
+$MOXYGEN_BUILD_PATH/moxygen/samples/flv_receiver_client/moqflvreceiverclient \
+  --insecure \
+  --flv_outpath ~/Movies/fifo-out.flv \
+  --dejitter_buffer_size_ms 300
+```
+
+</Steps>
+
+![Live Playback](./pics/moq-streamer-play.png)
+
+## MoqMi Media Packaging
+
+MoqMi (Media over QUIC - Media Interop) packages media frames for MOQT transport according to [draft-cenzano-moq-media-interop](https://datatracker.ietf.org/doc/draft-cenzano-moq-media-interop/).
+
+### How It Works
+
+#### Publisher Side
+
+```cpp
+// Streamer reads FLV and converts to MoqMi
+auto item = flvSeqReader.getNextItem(); // Read FLV tag
+auto moqMiObj = MoQMi::encodeToMoQMi(std::move(item));
+
+// Publish as MOQT object
+ObjectHeader objHeader = ObjectHeader{
+    largestVideo_.group++,
+    /*subgroupIn=*/0,
+    largestVideo_.object,
+    VIDEO_STREAM_PRIORITY,
+    ObjectStatus::NORMAL,
+    Extensions(std::move(moqMiObj->extensions), {})};
+
+videoPub_->objectStream(objHeader, std::move(moqMiObj->payload));
+```
+
+#### Subscriber Side
+
+```cpp
+// Receiver demuxes MoqMi from MOQT objects
+FlowControlState onObject(
+    std::optional<TrackAlias> trackAlias,
+    const ObjectHeader& objHeader,
+    Payload payload) override {
+  // Decode MoqMi
+  auto payloadDecodedData = MoQMi::decodeMoQMi(
+      std::make_unique<MoQMi::MoqMiObject>(
+          objHeader.extensions.getMutableExtensions(),
+          std::move(payload)));
+
+  // Convert to FLV tags and write
+  auto tags = MoQMiToFlv::MoQMiToFlvPayload(std::move(moqMiItem));
+  for (auto& tag : tags) {
+    flvWriter->writeTag(std::move(tag));
+  }
+
+  return FlowControlState::UNBLOCKED;
+}
+```
+
+### Group Structure
+
+**Video Track** (Stream per GOP):
+- Each **group** = one GOP (Group of Pictures)
+- Group starts with IDR (keyframe)
+- Group contains all dependent frames until next IDR
+- Allows subscribing from any keyframe boundary
+
+**Audio Track** (Stream per object):
+- Each **group** = one audio frame
+- Each frame on its own stream
+- Independent delivery for low latency
+
+```
+Video Groups:
+┌─────────────────┐  ┌─────────────────┐
+│ Group 0         │  │ Group 1         │
+│ ┌─────────────┐ │  │ ┌─────────────┐ │
+│ │ Obj 0: IDR  │ │  │ │ Obj 0: IDR  │ │
+│ ├─────────────┤ │  │ ├─────────────┤ │
+│ │ Obj 1: P    │ │  │ │ Obj 1: P    │ │
+│ ├─────────────┤ │  │ ├─────────────┤ │
+│ │ Obj 2: P    │ │  │ │ Obj 2: P    │ │
+│ └─────────────┘ │  │ └─────────────┘ │
+└─────────────────┘  └─────────────────┘
+
+Audio Objects:
+[Obj 0] [Obj 1] [Obj 2] [Obj 3] ...
+```
+
+## Browser Integration
+
+Connect browser-based WebCodecs encoder/player with native applications.
+
+### Browser → Application Playback
+
+<Steps>
+
+### Start Relay
+
+```bash
+$MOXYGEN_BUILD_PATH/moxygen/relay/moqrelayserver \
+  --cert [moq-encoder-player]/certs/certificate.pem \
+  --key [moq-encoder-player]/certs/certificate.key \
+  --endpoint "/moq" \
+  --port 4433
+```
+
+### Open Browser Encoder
+
+Navigate to: `http://localhost:8080/src-encoder/?local`
+
+**Configure:**
+- Namespace: `flvstreamer`
+- Track name prefix: (remove)
+- Audio codec: `AAC-LC`
+- Click **Start**
+
+![Browser Encoder](./pics/moq-streamer-encode-from-wc.png)
+
+### Start Application Receiver
+
+```bash
+mkfifo ~/Movies/fifo-out.flv
+ffplay ~/Movies/fifo-out.flv &
+
+$MOXYGEN_BUILD_PATH/moxygen/samples/flv_receiver_client/moqflvreceiverclient \
+  --insecure \
+  --flv_outpath ~/Movies/fifo-out.flv
+```
+
+</Steps>
+
+![Live playback from browser](./pics/moq-streamer-play-from-wc.png)
+
+### Application → Browser Playback
+
+<Steps>
+
+### Stream from Application
+
+```bash
+mkfifo ~/Movies/fifo.flv
+
+ffmpeg -y -f lavfi -re \
+  -i smptebars=duration=300:size=320x200:rate=30 \
+  -f lavfi -re \
+  -i sine=frequency=1000:duration=300:sample_rate=48000 \
+  -pix_fmt yuv420p \
+  -c:v libx264 -b:v 180k -g 60 -keyint_min 60 \
+  -profile:v baseline -preset veryfast \
+  -c:a aac -b:a 96k \
+  -f flv ~/Movies/fifo.flv &
+
+$MOXYGEN_BUILD_PATH/moxygen/samples/flv_streamer_client/moqflvstreamerclient \
+  --insecure \
+  --input_flv_file ~/Movies/fifo.flv
+```
+
+### Open Browser Player
+
+Navigate to: `http://localhost:8080/src-player/?local`
+
+**Configure:**
+- Namespace: `flvstreamer`
+- Track name: (remove)
+- Click **Start**
+
+</Steps>
+
+![Browser player](./pics/moq-wc-play-from-app.png)
+
+## Command-Line Options
+
+### MoQFlvStreamerClient
+
+```bash
+--input_flv_file          # FLV input file or FIFO
+--connect_url             # WebTransport URL (default: https://localhost:4433/moq)
+--track_namespace         # Namespace (default: flvstreamer)
+--track_namespace_delimiter # Delimiter (default: /)
+--video_track_name        # Video track (default: video0)
+--audio_track_name        # Audio track (default: audio0)
+--connect_timeout         # Connect timeout ms (default: 1000)
+--transaction_timeout     # Transaction timeout s (default: 120)
+--quic_transport          # Use raw QUIC instead of WebTransport
+--insecure                # Skip certificate validation
+--versions                # MoQ versions (e.g., "14,16")
+```
+
+### MoQFlvReceiverClient
+
+```bash
+--flv_outpath             # Output FLV file or FIFO
+--connect_url             # WebTransport URL
+--track_namespace         # Namespace (default: flvstreamer)
+--video_track_name        # Video track (default: video0)
+--audio_track_name        # Audio track (default: audio0)
+--dejitter_buffer_size_ms # Dejitter buffer in ms (default: 300)
+--fetch                   # Use FETCH instead of SUBSCRIBE
+--connect_timeout         # Connect timeout ms (default: 1000)
+--transaction_timeout     # Transaction timeout s (default: 120)
+--delivery_timeout        # Delivery timeout ms (0 = disabled)
+--quic_transport          # Use raw QUIC
+--insecure                # Skip certificate validation
+```
+
+## SDI Integration
+
+With capture cards supported by ffmpeg, you can ingest/output SDI broadcast feeds:
+
+![SDI to MoQ](./pics/sdi-to-moq.png)
+
+```bash
+# Ingest from SDI card (example with DeckLink)
+ffmpeg -f decklink -i 'DeckLink SDI' \
+  -c:v libx264 -preset ultrafast -tune zerolatency \
+  -c:a aac \
+  -f flv ~/Movies/sdi-input.flv
+
+# Output to SDI
+mkfifo ~/Movies/sdi-output.flv
+
+$MOXYGEN_BUILD_PATH/moxygen/samples/flv_receiver_client/moqflvreceiverclient \
+  --flv_outpath ~/Movies/sdi-output.flv &
+
+ffmpeg -re -i ~/Movies/sdi-output.flv \
+  -f decklink 'DeckLink SDI'
+```
+
+## Performance Tips
+
+<Note>
+**Dejitter Buffer**: Increase `--dejitter_buffer_size_ms` to handle network jitter, but this adds latency.
+</Note>
+
+<Note>
+**GOP Size**: Use `keyint` in ffmpeg to control GOP size. Smaller GOPs = lower latency, higher overhead.
+</Note>
+
+<Warning>
+Using FIFOs requires data to be written before the reader connects. Always start ffmpeg (writer) before the streamer client (reader).
+</Warning>
+
+## Next Steps
+
+- Learn about [Building a Publisher](/guides/building-publisher) to create custom media publishers
+- Explore [Setting Up a Relay](/guides/setting-up-relay) for multi-client scenarios
+- Understand [Threading Model](/guides/threading-model) for efficient media processing

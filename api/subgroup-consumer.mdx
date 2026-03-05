@@ -1,0 +1,322 @@
+---
+title: 'SubgroupConsumer'
+description: 'Interface for publishing and receiving objects within a subgroup'
+---
+
+## Overview
+
+The `SubgroupConsumer` interface handles object delivery within a single subgroup (identified by a group ID and subgroup ID). It is returned by `TrackConsumer::beginSubgroup()` and provides methods for delivering complete objects, streaming large objects in chunks, and signaling group boundaries.
+
+This interface is used bidirectionally:
+
+- **For publishers**: Methods are invoked to send objects to subscribers
+- **For subscribers**: Methods are invoked when objects are received from publishers
+
+## API Semantics
+
+The `SubgroupConsumer` enforces strict ordering and state requirements:
+
+<Warning>
+**Critical Requirements:**
+
+- Object IDs must be strictly increasing within the subgroup
+- When streaming objects with `beginObject()`/`objectPayload()`, the total bytes delivered must exactly match the length specified in `beginObject()`
+- It's an error to begin delivering any object/status or close the stream in the middle of a streaming object
+- If any method returns a `MoQPublishError`, the SubgroupConsumer is implicitly reset and no further API calls should be made on it
+- Calling `reset()` after an error is a no-op
+</Warning>
+
+## Methods
+
+### object
+
+Delivers a complete object on this subgroup.
+
+```cpp
+folly::Expected<folly::Unit, MoQPublishError> object(
+    uint64_t objectID,
+    Payload payload,
+    Extensions extensions = noExtensions(),
+    bool finSubgroup = false)
+```
+
+<ParamField path="objectID" type="uint64_t" required>
+  The object identifier. Must be strictly larger than the last delivered object ID on this subgroup.
+</ParamField>
+
+<ParamField path="payload" type="Payload" required>
+  The complete object payload data.
+</ParamField>
+
+<ParamField path="extensions" type="Extensions" default="noExtensions()">
+  Optional extensions to attach to this object (custom metadata).
+</ParamField>
+
+<ParamField path="finSubgroup" type="bool" default="false">
+  If true, indicates this is the last object in the subgroup and closes the underlying stream.
+</ParamField>
+
+<ResponseField name="return" type="folly::Expected<folly::Unit, MoQPublishError>">
+  Returns `folly::Unit` on success, or `MoQPublishError` if the object cannot be delivered (invalid state, ordering violation, etc.).
+</ResponseField>
+
+<Info>
+This method delivers a complete object in a single call. For large objects, consider using `beginObject()` and `objectPayload()` to stream the data in chunks.
+</Info>
+
+### beginObject
+
+Begins delivering a large object that will be streamed in multiple chunks.
+
+```cpp
+folly::Expected<folly::Unit, MoQPublishError> beginObject(
+    uint64_t objectID,
+    uint64_t length,
+    Payload initialPayload,
+    Extensions extensions = noExtensions())
+```
+
+<ParamField path="objectID" type="uint64_t" required>
+  The object identifier. Must be strictly larger than the last delivered object ID on this subgroup.
+</ParamField>
+
+<ParamField path="length" type="uint64_t" required>
+  The total length of the object in bytes. The sum of all payload chunks (including `initialPayload`) must exactly equal this value.
+</ParamField>
+
+<ParamField path="initialPayload" type="Payload" required>
+  The first chunk of the object's payload data.
+</ParamField>
+
+<ParamField path="extensions" type="Extensions" default="noExtensions()">
+  Optional extensions to attach to this object.
+</ParamField>
+
+<ResponseField name="return" type="folly::Expected<folly::Unit, MoQPublishError>">
+  Returns `folly::Unit` on success, or `MoQPublishError` if the object cannot be started.
+</ResponseField>
+
+<Note>
+After calling `beginObject()`, you must call `objectPayload()` one or more times to deliver the remaining data until the total delivered bytes equals the specified `length`.
+</Note>
+
+### objectPayload
+
+Delivers the next chunk of data for a streaming object.
+
+```cpp
+folly::Expected<ObjectPublishStatus, MoQPublishError> objectPayload(
+    Payload payload,
+    bool finSubgroup = false)
+```
+
+<ParamField path="payload" type="Payload" required>
+  The next chunk of object data.
+</ParamField>
+
+<ParamField path="finSubgroup" type="bool" default="false">
+  If true and this is the final chunk, also closes the subgroup stream.
+</ParamField>
+
+<ResponseField name="return" type="folly::Expected<ObjectPublishStatus, MoQPublishError>">
+  Returns:
+  - `ObjectPublishStatus::IN_PROGRESS` if more data is expected
+  - `ObjectPublishStatus::DONE` if the payload exactly completed the object (total bytes now equals the length specified in `beginObject()`)
+  - `MoQPublishError` on failure
+</ResponseField>
+
+<Warning>
+The total bytes delivered via `objectPayload()` calls (plus the initial payload from `beginObject()`) must exactly match the `length` parameter from `beginObject()`. Delivering too many or too few bytes is an error.
+</Warning>
+
+### endOfGroup
+
+Delivers an Object Status message indicating the end of the group.
+
+```cpp
+folly::Expected<folly::Unit, MoQPublishError> endOfGroup(
+    uint64_t endOfGroupObjectID)
+```
+
+<ParamField path="endOfGroupObjectID" type="uint64_t" required>
+  The object ID for the EndOfGroup status message. Must be strictly larger than the last delivered object ID.
+</ParamField>
+
+<ResponseField name="return" type="folly::Expected<folly::Unit, MoQPublishError>">
+  Returns `folly::Unit` on success, or `MoQPublishError` on failure.
+</ResponseField>
+
+<Info>
+This method delivers an Object Status=EndOfGroup for the specified object ID and implies `endOfSubgroup()` - the subgroup stream will be closed.
+</Info>
+
+### endOfTrackAndGroup
+
+Delivers an Object Status message indicating the end of both the track and the group.
+
+```cpp
+folly::Expected<folly::Unit, MoQPublishError> endOfTrackAndGroup(
+    uint64_t endOfTrackObjectID)
+```
+
+<ParamField path="endOfTrackObjectID" type="uint64_t" required>
+  The object ID for the EndOfTrackAndGroup status message. Must be strictly larger than the last delivered object ID.
+</ParamField>
+
+<ResponseField name="return" type="folly::Expected<folly::Unit, MoQPublishError>">
+  Returns `folly::Unit` on success, or `MoQPublishError` on failure.
+</ResponseField>
+
+<Info>
+This method delivers an Object Status=EndOfTrackAndGroup for the specified object ID and implies `endOfSubgroup()` - the subgroup stream will be closed.
+</Info>
+
+### endOfSubgroup
+
+Informs the consumer that the subgroup is complete and closes the underlying stream.
+
+```cpp
+folly::Expected<folly::Unit, MoQPublishError> endOfSubgroup()
+```
+
+<ResponseField name="return" type="folly::Expected<folly::Unit, MoQPublishError>">
+  Returns `folly::Unit` on success, or `MoQPublishError` on failure.
+</ResponseField>
+
+<Warning>
+This method can only be called if the publisher knows the entire subgroup has been delivered successfully. If the consumer is writing, this closes the underlying transport stream.
+</Warning>
+
+### reset
+
+Terminates the subgroup with an error and resets the underlying stream.
+
+```cpp
+void reset(ResetStreamErrorCode error)
+```
+
+<ParamField path="error" type="ResetStreamErrorCode" required>
+  The error code to report when resetting the stream.
+</ParamField>
+
+<Info>
+If the consumer is writing, this resets the transport stream with the given error code. The stream will be reliably delivered up to the last `checkpoint()`.
+</Info>
+
+### checkpoint
+
+Advances the reliable offset of the subgroup stream to the current position.
+
+```cpp
+void checkpoint()
+```
+
+<Note>
+Checkpoints mark positions in the stream that will be reliably delivered even if the stream is later reset. Data written after the last checkpoint may be lost if `reset()` is called.
+</Note>
+
+## Object Delivery Patterns
+
+### Pattern 1: Complete Objects
+
+For small to medium objects, deliver them in a single call:
+
+```cpp
+uint64_t objectId = 0;
+while (hasMoreObjects()) {
+  auto payload = getNextPayload();
+  auto result = subgroup->object(objectId++, std::move(payload));
+  if (result.hasError()) {
+    subgroup->reset(ResetStreamErrorCode::INTERNAL_ERROR);
+    return;
+  }
+}
+subgroup->endOfSubgroup();
+```
+
+### Pattern 2: Streaming Large Objects
+
+For large objects, stream them in chunks:
+
+```cpp
+uint64_t objectId = 0;
+uint64_t totalSize = calculateObjectSize();
+auto firstChunk = readChunk();
+
+auto result = subgroup->beginObject(
+    objectId++, totalSize, std::move(firstChunk));
+if (result.hasError()) {
+  return;
+}
+
+while (hasMoreChunks()) {
+  auto chunk = readChunk();
+  auto status = subgroup->objectPayload(std::move(chunk));
+  
+  if (status.hasError()) {
+    subgroup->reset(ResetStreamErrorCode::INTERNAL_ERROR);
+    return;
+  }
+  
+  if (status.value() == ObjectPublishStatus::DONE) {
+    break; // Object complete
+  }
+}
+```
+
+### Pattern 3: Group Boundaries
+
+Signal the end of a group:
+
+```cpp
+// Deliver regular objects
+for (uint64_t objectId = 0; objectId < lastObjectId; objectId++) {
+  auto payload = getNextPayload();
+  subgroup->object(objectId, std::move(payload));
+}
+
+// Signal end of group with final object ID
+subgroup->endOfGroup(lastObjectId);
+// Note: endOfGroup() implicitly closes the subgroup
+```
+
+### Pattern 4: Reliable Delivery with Checkpoints
+
+Use checkpoints to ensure critical data is reliably delivered:
+
+```cpp
+for (uint64_t objectId = 0; objectId < numObjects; objectId++) {
+  auto payload = getNextPayload();
+  subgroup->object(objectId, std::move(payload));
+  
+  // Checkpoint after every critical object
+  if (isCritical(objectId)) {
+    subgroup->checkpoint();
+  }
+}
+
+// If reset() is called, data up to the last checkpoint is guaranteed delivered
+```
+
+## Error Handling
+
+<Warning>
+**Important**: If any method returns a `MoQPublishError`, the SubgroupConsumer is implicitly reset and you must not make any further API calls on it. The error indicates a terminal state.
+</Warning>
+
+```cpp
+auto result = subgroup->object(objectId, std::move(payload));
+if (result.hasError()) {
+  // SubgroupConsumer is now invalid - do NOT call reset() or any other method
+  auto error = result.error();
+  LOG(ERROR) << "Failed to publish object: " << error.describe();
+  // Clean up and abandon this subgroup
+  return;
+}
+```
+
+## See Also
+
+- [TrackConsumer](/api/track-consumer) - Parent interface that creates SubgroupConsumers
+- [FetchConsumer](/api/fetch-consumer) - Similar interface for FETCH requests
+- [Object Headers and Types](/api/types) - ObjectHeader, Payload, and Extensions types

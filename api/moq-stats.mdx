@@ -1,0 +1,393 @@
+---
+title: "MoQStats"
+description: "Statistics callbacks for monitoring publisher and subscriber operations"
+---
+
+## Overview
+
+`MoQStats` provides callback interfaces for collecting statistics and monitoring MOQT protocol operations. Applications can implement these callbacks to track subscription success/failure, object delivery, latency, and other metrics.
+
+**Source**: `moxygen/stats/MoQStats.h`
+
+## Callback Interfaces
+
+### MoQStatsCallback
+
+Base interface with statistics common to both publishers and subscribers.
+
+```cpp MoQStats.h
+class MoQStatsCallback {
+ public:
+  virtual ~MoQStatsCallback() = default;
+  
+  // Subscription operations
+  virtual void onSubscribeSuccess() = 0;
+  virtual void onSubscribeError(SubscribeErrorCode errorCode) = 0;
+  
+  // Fetch operations
+  virtual void onFetchSuccess() = 0;
+  virtual void onFetchError(FetchErrorCode errorCode) = 0;
+  
+  // Namespace operations
+  virtual void onPublishNamespaceSuccess() = 0;
+  virtual void onPublishNamespaceError(PublishNamespaceErrorCode errorCode) = 0;
+  virtual void onPublishNamespaceDone() = 0;
+  virtual void onPublishNamespaceCancel() = 0;
+  
+  virtual void onSubscribeNamespaceSuccess() = 0;
+  virtual void onSubscribeNamespaceError(SubscribeNamespaceErrorCode errorCode) = 0;
+  virtual void onUnsubscribeNamespace() = 0;
+  
+  // Other operations
+  virtual void onTrackStatus() = 0;
+  virtual void onUnsubscribe() = 0;
+  virtual void onPublishDone(PublishDoneStatusCode statusCode) = 0;
+  virtual void onRequestUpdate() = 0;
+  
+  // Stream lifecycle
+  virtual void onSubscriptionStreamOpened() = 0;
+  virtual void onSubscriptionStreamClosed() = 0;
+};
+```
+
+### MoQPublisherStatsCallback
+
+Publisher-specific statistics.
+
+```cpp
+class MoQPublisherStatsCallback : public MoQStatsCallback {
+ public:
+  // Latency tracking
+  virtual void recordPublishNamespaceLatency(uint64_t latencyMsec) = 0;
+  virtual void recordPublishLatency(uint64_t latencyMsec) = 0;
+  
+  // Publish operations
+  virtual void onPublishError(PublishErrorCode errorCode) = 0;
+  virtual void onPublishSuccess() = 0;
+};
+```
+
+### MoQSubscriberStatsCallback
+
+Subscriber-specific statistics.
+
+```cpp
+class MoQSubscriberStatsCallback : public MoQStatsCallback {
+ public:
+  // Latency tracking
+  virtual void recordSubscribeLatency(uint64_t latencyMsec) = 0;
+  virtual void recordFetchLatency(uint64_t latencyMsec) = 0;
+  
+  // Publish handling (for receiving PUBLISH requests)
+  virtual void onPublish() = 0;
+  virtual void onPublishOk() = 0;
+  virtual void onPublishError(PublishErrorCode errorCode) = 0;
+};
+```
+
+## Callback Semantics
+
+Each callback documents when it's called for publisher vs subscriber:
+
+### onSubscribeSuccess
+
+- **Publisher**: Responded to a SUBSCRIBE request with SUBSCRIBE_OK
+- **Subscriber**: Received a SUBSCRIBE_OK from the publisher
+
+### onSubscribeError
+
+- **Publisher**: Responded to a SUBSCRIBE request with SUBSCRIBE_ERROR
+- **Subscriber**: Received a SUBSCRIBE_ERROR from the publisher
+
+### onFetchSuccess
+
+- **Publisher**: Responded to a FETCH request with FETCH_OK
+- **Subscriber**: Received a FETCH_OK from the publisher
+
+### onFetchError
+
+- **Publisher**: Responded to a FETCH request with FETCH_ERROR
+- **Subscriber**: Received a FETCH_ERROR from the publisher
+
+### onPublishNamespaceSuccess
+
+- **Publisher**: Received PUBLISH_NAMESPACE_OK from the subscriber
+- **Subscriber**: Responded to PUBLISH_NAMESPACE with PUBLISH_NAMESPACE_OK
+
+### onPublishDone
+
+- **Publisher**: Sent a PUBLISH_DONE message
+- **Subscriber**: Received a PUBLISH_DONE message
+
+## Setting Callbacks on MoQSession
+
+```cpp
+void setPublisherStatsCallback(
+    std::shared_ptr<MoQPublisherStatsCallback> callback);
+
+void setSubscriberStatsCallback(
+    std::shared_ptr<MoQSubscriberStatsCallback> callback);
+```
+
+## Implementation Example
+
+```cpp stats_impl.cpp
+class MyStats : public MoQPublisherStatsCallback {
+ public:
+  // Subscription tracking
+  void onSubscribeSuccess() override {
+    subscribes_.success++;
+  }
+  
+  void onSubscribeError(SubscribeErrorCode errorCode) override {
+    subscribes_.errors[errorCode]++;
+  }
+  
+  // Latency tracking
+  void recordPublishNamespaceLatency(uint64_t latencyMsec) override {
+    publishNamespaceLatency_.add(latencyMsec);
+  }
+  
+  void recordPublishLatency(uint64_t latencyMsec) override {
+    publishLatency_.add(latencyMsec);
+  }
+  
+  // Fetch tracking
+  void onFetchSuccess() override {
+    fetches_.success++;
+  }
+  
+  void onFetchError(FetchErrorCode errorCode) override {
+    fetches_.errors[errorCode]++;
+  }
+  
+  // Stream lifecycle
+  void onSubscriptionStreamOpened() override {
+    activeStreams_++;
+  }
+  
+  void onSubscriptionStreamClosed() override {
+    activeStreams_--;
+  }
+  
+  // Publish operations
+  void onPublishSuccess() override {
+    publishes_.success++;
+  }
+  
+  void onPublishError(PublishErrorCode errorCode) override {
+    publishes_.errors[errorCode]++;
+  }
+  
+  void onPublishDone(PublishDoneStatusCode statusCode) override {
+    publishDones_[statusCode]++;
+  }
+  
+  // Namespace operations (stub implementations)
+  void onPublishNamespaceSuccess() override {}
+  void onPublishNamespaceError(PublishNamespaceErrorCode) override {}
+  void onPublishNamespaceDone() override {}
+  void onPublishNamespaceCancel() override {}
+  void onSubscribeNamespaceSuccess() override {}
+  void onSubscribeNamespaceError(SubscribeNamespaceErrorCode) override {}
+  void onUnsubscribeNamespace() override {}
+  void onTrackStatus() override {}
+  void onUnsubscribe() override {}
+  void onRequestUpdate() override {}
+  
+  // Expose metrics
+  void report() {
+    std::cout << "Subscribes: " << subscribes_.success 
+              << " success, " << subscribes_.errorCount() << " errors\n";
+    std::cout << "Fetches: " << fetches_.success
+              << " success, " << fetches_.errorCount() << " errors\n";
+    std::cout << "Active streams: " << activeStreams_ << "\n";
+    std::cout << "Publish latency avg: " 
+              << publishLatency_.mean() << "ms\n";
+  }
+  
+ private:
+  struct Counter {
+    uint64_t success{0};
+    std::map<uint32_t, uint64_t> errors;
+    uint64_t errorCount() const {
+      uint64_t total = 0;
+      for (auto& [code, count] : errors) total += count;
+      return total;
+    }
+  };
+  
+  struct LatencyStats {
+    void add(uint64_t value) {
+      sum_ += value;
+      count_++;
+    }
+    double mean() const {
+      return count_ > 0 ? double(sum_) / count_ : 0;
+    }
+    uint64_t sum_{0};
+    uint64_t count_{0};
+  };
+  
+  Counter subscribes_;
+  Counter fetches_;
+  Counter publishes_;
+  std::map<PublishDoneStatusCode, uint64_t> publishDones_;
+  LatencyStats publishNamespaceLatency_;
+  LatencyStats publishLatency_;
+  std::atomic<int64_t> activeStreams_{0};
+};
+```
+
+## Usage with MoQSession
+
+```cpp session_with_stats.cpp
+// Create stats callback
+auto stats = std::make_shared<MyStats>();
+
+// Create session
+auto session = std::make_shared<MoQSession>(wt, executor);
+
+// Attach stats
+session->setPublisherStatsCallback(stats);
+
+// Stats are now tracked automatically
+co_await session->subscribe(req, consumer);
+// -> onSubscribeSuccess() or onSubscribeError() called
+
+// Report metrics periodically
+executor->scheduleTimeout([stats]() {
+  stats->report();
+}, std::chrono::seconds(60));
+```
+
+## Helper Macros
+
+Internal macros for invoking callbacks:
+
+```cpp
+#define MOQ_PUBLISHER_STATS(publisherStatsCallback, method, ...) \
+  if (publisherStatsCallback) {                                  \
+    folly::invoke(                                               \
+        &MoQPublisherStatsCallback::method,                      \
+        publisherStatsCallback,                                  \
+        ##__VA_ARGS__);                                          \
+  }
+
+#define MOQ_SUBSCRIBER_STATS(subscriberStatsCallback, method, ...) \
+  if (subscriberStatsCallback) {                                   \
+    folly::invoke(                                                 \
+        &MoQSubscriberStatsCallback::method,                       \
+        subscriberStatsCallback,                                   \
+        ##__VA_ARGS__);                                            \
+  }
+```
+
+**Usage in MoQSession**:
+```cpp moqsession_usage.cpp
+MOQ_PUBLISHER_STATS(publisherStatsCallback_, onSubscribeSuccess);
+MOQ_SUBSCRIBER_STATS(subscriberStatsCallback_, recordSubscribeLatency, latency);
+```
+
+## Integration with Monitoring Systems
+
+### Prometheus Example
+
+```cpp prometheus_stats.cpp
+class PrometheusStats : public MoQPublisherStatsCallback {
+ public:
+  PrometheusStats(prometheus::Registry& registry) {
+    subscribes_ = &prometheus::BuildCounter()
+      .Name("moq_subscribes_total")
+      .Register(registry);
+    
+    subscribeErrors_ = &prometheus::BuildCounter()
+      .Name("moq_subscribe_errors_total")
+      .Register(registry);
+    
+    publishLatency_ = &prometheus::BuildHistogram()
+      .Name("moq_publish_latency_ms")
+      .Register(registry);
+  }
+  
+  void onSubscribeSuccess() override {
+    subscribes_->Add({}).Increment();
+  }
+  
+  void onSubscribeError(SubscribeErrorCode errorCode) override {
+    subscribeErrors_->Add({{"code", std::to_string(uint32_t(errorCode))}}).Increment();
+  }
+  
+  void recordPublishLatency(uint64_t latencyMsec) override {
+    publishLatency_->Add({}).Observe(latencyMsec);
+  }
+  
+  // ... other methods
+  
+ private:
+  prometheus::Family<prometheus::Counter>* subscribes_;
+  prometheus::Family<prometheus::Counter>* subscribeErrors_;
+  prometheus::Family<prometheus::Histogram>* publishLatency_;
+};
+```
+
+### StatsD Example
+
+```cpp statsd_stats.cpp
+class StatsDStats : public MoQPublisherStatsCallback {
+ public:
+  explicit StatsDStats(StatsDClient& client) : client_(client) {}
+  
+  void onSubscribeSuccess() override {
+    client_.increment("moq.subscribes.success");
+  }
+  
+  void onSubscribeError(SubscribeErrorCode errorCode) override {
+    client_.increment("moq.subscribes.error");
+    client_.increment(
+      "moq.subscribes.error." + std::to_string(uint32_t(errorCode))
+    );
+  }
+  
+  void recordPublishLatency(uint64_t latencyMsec) override {
+    client_.timing("moq.publish.latency", latencyMsec);
+  }
+  
+  // ... other methods
+  
+ private:
+  StatsDClient& client_;
+};
+```
+
+## Best Practices
+
+<Accordion title="Use Lightweight Implementations">
+  Stats callbacks are called frequently - keep implementations fast and avoid blocking operations.
+</Accordion>
+
+<Accordion title="Aggregate Metrics">
+  Instead of logging every event, aggregate counts, latencies, and percentiles.
+</Accordion>
+
+<Accordion title="Thread Safety">
+  Callbacks are invoked on the session's executor thread. Use atomic operations or locks if accessing shared state.
+</Accordion>
+
+<Accordion title="Graceful Degradation">
+  If stats collection fails, don't crash - log the error and continue.
+</Accordion>
+
+## Related Classes
+
+<CardGroup cols={3}>
+  <Card title="MoQSession" href="/api/moq-session">
+    setPublisherStatsCallback, setSubscriberStatsCallback
+  </Card>
+  <Card title="MoQTypes" href="/api/moq-types">
+    Error code enums
+  </Card>
+  <Card title="Publisher" href="/api/publisher">
+    Operations tracked by stats
+  </Card>
+</CardGroup>

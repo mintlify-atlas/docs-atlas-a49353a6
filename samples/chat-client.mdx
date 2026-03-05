@@ -1,0 +1,469 @@
+---
+title: Chat Client Sample
+description: A bidirectional MOQT chat application demonstrating simultaneous publishing and subscribing
+---
+
+The Chat Client demonstrates how a single application can act as both a MOQT publisher and subscriber simultaneously. It implements a multi-user chat room where participants can send and receive messages in real-time.
+
+## What It Does
+
+The Chat Client:
+- Publishes messages to its own participant track
+- Subscribes to other participants' tracks via namespace discovery
+- Demonstrates bidirectional MOQT communication
+- Supports multiple devices per user
+- Handles participant join/leave events
+- Uses namespace-based discovery for automatic connection to new participants
+
+## Source Code
+
+The sample is located at:
+```
+moxygen/samples/chat/
+├── MoQChatClient.cpp
+└── MoQChatClient.h
+```
+
+## Building the Sample
+
+The Chat Client is built automatically with Moxygen:
+
+```bash
+./build/fbcode_builder/getdeps.py build moxygen
+```
+
+The binary will be at:
+```bash
+$MOXYGEN_BUILD_PATH/moxygen/samples/chat/moqchatclient
+```
+
+## Running the Chat Client
+
+### Prerequisites
+
+Start a relay server first:
+
+```bash
+$MOXYGEN_BUILD_PATH/moxygen/relay/moqrelayserver \
+  --cert ./certs/certificate.pem \
+  --key ./certs/certificate.key \
+  --endpoint "/moq" \
+  --port 4433
+```
+
+### Basic Usage
+
+Start a chat client and join a room:
+
+```bash
+$MOXYGEN_BUILD_PATH/moxygen/samples/chat/moqchatclient \
+  --insecure \
+  --connect_url "https://localhost:4433/moq" \
+  --chat_id "room1" \
+  --username "alice"
+```
+
+### Command-Line Options
+
+| Flag | Description | Default |
+|------|-------------|----------|
+| `--connect_url` | URL of the MOQT relay | Required |
+| `--chat_id` | Chat room ID to join | Required |
+| `--username` | Your username | Required |
+| `--device` | Device ID | `"12345"` |
+| `--insecure` | Skip certificate validation | `false` |
+| `--connect_timeout` | Connection timeout in ms | `1000` |
+| `--transaction_timeout` | Transaction timeout in seconds | `120` |
+| `--versions` | Comma-separated MoQ draft versions | All supported |
+
+## Multi-User Chat Scenario
+
+### Terminal 1: Alice joins
+
+```bash
+$MOXYGEN_BUILD_PATH/moxygen/samples/chat/moqchatclient \
+  --insecure \
+  --connect_url "https://localhost:4433/moq" \
+  --chat_id "room1" \
+  --username "alice"
+```
+
+Alice types:
+```
+Hello everyone!
+```
+
+### Terminal 2: Bob joins
+
+```bash
+$MOXYGEN_BUILD_PATH/moxygen/samples/chat/moqchatclient \
+  --insecure \
+  --connect_url "https://localhost:4433/moq" \
+  --chat_id "room1" \
+  --username "bob"
+```
+
+Bob sees:
+```
+alice: Hello everyone!
+```
+
+Bob types:
+```
+Hi Alice!
+```
+
+Alice sees:
+```
+bob: Hi Alice!
+```
+
+### Leaving the Chat
+
+Type `/leave` to exit:
+```
+/leave
+```
+
+Other participants will see the user disconnect.
+
+## Track Structure
+
+### Namespace Hierarchy
+
+Each participant publishes to a unique namespace:
+
+```
+moq-chat / <chat_id> / <username> / <device_id> / <timestamp>
+```
+
+**Example:**
+```
+moq-chat / room1 / alice / 12345 / 1728312000
+```
+
+### Track Name
+
+The track name within each namespace is:
+```
+chat
+```
+
+### Complete Track Examples
+
+| User | Full Track Name |
+|------|------------------|
+| Alice | `moq-chat/room1/alice/12345/1728312000/chat` |
+| Bob | `moq-chat/room1/bob/12345/1728312001/chat` |
+
+## How It Works
+
+### 1. Initialization
+
+When a client starts:
+
+```cpp
+// Publish own namespace
+co_await session->publishNamespace({
+    RequestID(0),
+    participantTrackName(username_)
+});
+
+// Subscribe to chat room namespace prefix
+SubscribeNamespace subAnn{
+    .requestID = RequestID(0),
+    .trackNamespacePrefix = TrackNamespace(chatPrefix()),
+    .forward = true,
+    .options = SubscribeNamespaceOptions::BOTH
+};
+co_await session->subscribeNamespace(subAnn, handler);
+```
+
+See: `MoQChatClient.cpp:69-96`
+
+### 2. Discovery
+
+When another user publishes their namespace, the relay notifies all subscribers:
+
+```cpp
+void namespaceMsg(const TrackNamespace& trackNamespaceSuffix) override {
+    // Reconstruct full namespace
+    TrackNamespace fullNs(prefix_ + trackNamespaceSuffix);
+    // Subscribe to this participant
+    co_await client_->subscribeToUser(std::move(fullNs));
+}
+```
+
+See: `MoQChatClient.cpp:171-189`
+
+### 3. Subscribe to Participants
+
+For each discovered participant:
+
+```cpp
+folly::coro::Task<void> subscribeToUser(TrackNamespace trackNamespace) {
+    std::string username = trackNamespace[2];
+    std::string deviceId = trackNamespace[3];
+    std::string timestampStr = trackNamespace[4];
+
+    // Subscribe to their chat track
+    auto req = SubscribeRequest::make(
+        FullTrackName({trackNamespace, "chat"}));
+    auto track = co_await session->subscribe(req, receiver);
+
+    // Track the subscription
+    subscriptions_[username].emplace_back(
+        UserTrack{deviceId, timestamp, requestID});
+}
+```
+
+See: `MoQChatClient.cpp:288-391`
+
+### 4. Publishing Messages
+
+Messages are published as objects in an incrementing group sequence:
+
+```cpp
+void handleInput(const std::string& input) {
+    if (input == "/leave") {
+        // Send end-of-track
+        publisher_->objectStream({
+            nextGroup_++,
+            /*subgroupIn=*/0,
+            /*idIn=*/0,
+            /*priorityIn=*/0,
+            ObjectStatus::END_OF_TRACK
+        }, nullptr);
+        // Close session
+        moqClient_.getSession()->close(SessionCloseErrorCode::NO_ERROR);
+    } else {
+        // Publish message
+        publisher_->objectStream({
+            nextGroup_++,
+            /*subgroupIn=*/0,
+            /*idIn=*/0,
+            /*priorityIn=*/0,
+            ObjectStatus::NORMAL
+        }, folly::IOBuf::copyBuffer(input));
+    }
+}
+```
+
+See: `MoQChatClient.cpp:257-286`
+
+### 5. Receiving Messages
+
+Incoming messages are handled by the `ChatObjectHandler`:
+
+```cpp
+class ChatObjectHandler : public ObjectReceiverCallback {
+    FlowControlState onObject(
+        std::optional<TrackAlias> trackAlias,
+        const ObjectHeader&,
+        Payload payload) override {
+        if (payload) {
+            std::cout << username_ << ": ";
+            payload->coalesce();
+            std::cout << payload->moveToFbString() << std::endl;
+        }
+        return FlowControlState::UNBLOCKED;
+    }
+
+    void onPublishDone(PublishDone pubDone) override {
+        // User has left
+        client_.publishDone(std::move(pubDone));
+        baton.post();
+    }
+};
+```
+
+See: `MoQChatClient.cpp:333-368`
+
+## Architecture Diagram
+
+```
+┌─────────────────┐          ┌──────────────┐          ┌─────────────────┐
+│  Alice Client   │          │  MoQ Relay   │          │   Bob Client    │
+│                 │          │              │          │                 │
+│ Publisher &     │◄────────►│  Forwards    │◄────────►│ Publisher &     │
+│ Subscriber      │          │  Namespaces  │          │ Subscriber      │
+│                 │          │  & Tracks    │          │                 │
+└─────────────────┘          └──────────────┘          └─────────────────┘
+        │                            │                          │
+        │  1. publishNamespace       │                          │
+        │───────────────────────────►│                          │
+        │                            │  2. subscribeNamespace   │
+        │                            │◄─────────────────────────│
+        │                            │                          │
+        │                            │  3. Notify: Alice joined │
+        │                            ├─────────────────────────►│
+        │                            │                          │
+        │  4. Bob subscribes to Alice                           │
+        │◄──────────────────────────┼──────────────────────────│
+        │                            │                          │
+        │  5. Alice publishes message                           │
+        ├───────────────────────────►│  6. Forward to Bob       │
+        │                            ├─────────────────────────►│
+```
+
+## Key Concepts Demonstrated
+
+<AccordionGroup>
+  <Accordion title="Dual Publisher/Subscriber Role">
+    The chat client acts as both:
+    - **Publisher** - For its own messages
+    - **Subscriber** - For other participants' messages
+
+    This is implemented by having `MoQChatClient` inherit from both `Publisher` and `Subscriber`.
+  </Accordion>
+
+  <Accordion title="Namespace-Based Discovery">
+    Uses `subscribeNamespace()` to:
+    - Advertise own presence: `publishNamespace()`
+    - Discover others: `subscribeNamespace()` with prefix
+    - Receive notifications: `namespaceMsg()` callback
+
+    This enables automatic peer discovery without hardcoding participant lists.
+  </Accordion>
+
+  <Accordion title="Multi-Device Support">
+    Each user can join from multiple devices:
+    ```
+    moq-chat/room1/alice/laptop/1728312000
+    moq-chat/room1/alice/phone/1728312030
+    ```
+
+    The client tracks subscriptions per device and handles reconnects.
+  </Accordion>
+
+  <Accordion title="Graceful Departure">
+    When leaving:
+    1. Send `END_OF_TRACK` object status
+    2. Call `publishNamespaceDone()`
+    3. Close the session
+
+    Other clients receive `PublishDone` and clean up subscriptions.
+  </Accordion>
+
+  <Accordion title="Message Ordering">
+    Each message is a separate **group** with a single object:
+    - Group 0: First message
+    - Group 1: Second message
+    - Group 2: Third message
+    - etc.
+
+    This ensures proper ordering and allows for future enhancement (e.g., replies as objects within a group).
+  </Accordion>
+</AccordionGroup>
+
+## Advanced Usage
+
+### Multiple Devices
+
+Run the same user from different devices:
+
+```bash
+# Device 1
+moqchatclient --username "alice" --device "laptop" --chat_id "room1"
+
+# Device 2
+moqchatclient --username "alice" --device "phone" --chat_id "room1"
+```
+
+Both devices will publish and receive independently.
+
+### Private Rooms
+
+Use different `--chat_id` values to create isolated rooms:
+
+```bash
+# Room 1
+moqchatclient --chat_id "team-alpha" --username "alice"
+
+# Room 2 (separate)
+moqchatclient --chat_id "team-beta" --username "bob"
+```
+
+Users in different rooms won't see each other.
+
+### Authentication
+
+The client supports authentication parameters:
+
+```cpp
+subAnn.params.insertParam(
+    getAuthParam(negotiatedVersion, username_));
+```
+
+See: `MoQChatClient.cpp:87`
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Not seeing other users' messages">
+    Check that all clients use the same `--chat_id`:
+    ```bash
+    # All clients must match
+    --chat_id "room1"
+    ```
+  </Accordion>
+
+  <Accordion title="PublishNamespace error">
+    Ensure the relay is running and accessible:
+    ```bash
+    # Start relay first
+    moqrelayserver --cert ./certs/certificate.pem \
+                   --key ./certs/certificate.key \
+                   --endpoint "/moq" --port 4433
+    ```
+  </Accordion>
+
+  <Accordion title="Cannot send messages">
+    Wait for the connection to complete. You should see:
+    ```
+    I.... MoQChatClient.cpp:96] subscribeNamespace success
+    ```
+    Before typing messages.
+  </Accordion>
+
+  <Accordion title="Old messages not visible">
+    The chat client only shows **new messages** from the time you join. Historical messages are not fetched.
+  </Accordion>
+</AccordionGroup>
+
+## Extending the Sample
+
+### Add Typing Indicators
+
+Use a separate track for presence:
+```
+moq-chat/room1/alice/12345/1728312000/presence
+```
+
+### Add File Sharing
+
+Publish binary objects:
+```cpp
+publisher_->objectStream(header, folly::IOBuf::copyBuffer(fileData));
+```
+
+### Add Reactions
+
+Use object extensions to attach metadata:
+```cpp
+Extensions extensions{
+    {0x1, folly::to<uint64_t>(originalGroupId)},  // Reply-to
+    {0x2, folly::to<uint64_t>(emojiReaction)}     // Emoji
+};
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Publisher API" icon="book" href="/api-reference/publisher">
+    Learn about publishing tracks
+  </Card>
+  <Card title="Subscriber API" icon="book" href="/api-reference/subscriber">
+    Learn about subscribing to tracks
+  </Card>
+</CardGroup>

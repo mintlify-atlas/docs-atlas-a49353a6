@@ -1,0 +1,514 @@
+---
+title: Publisher
+description: Interface for handling subscription requests and serving content
+---
+
+## Overview
+
+The `Publisher` interface defines the contract for components that can respond to subscription requests and serve media content. It provides methods for handling `SUBSCRIBE`, `FETCH`, `SUBSCRIBE_NAMESPACE`, and `TRACK_STATUS_REQUEST` messages.
+
+**Header:** `moxygen/Publisher.h`
+
+### Symmetric Design
+
+The Publisher interface follows a symmetric design pattern:
+- **Subscribers call** methods like `subscribe()` on a publisher to request data
+- **Publishers implement** these methods to handle incoming requests
+- This symmetry enables **chaining**: output from one component feeds into the next
+
+### Key Concepts
+
+- **Coroutine-Based**: All methods return `folly::coro::Task` for async operations
+- **Expected Types**: Methods return `folly::Expected<Success, Error>` for error handling
+- **Handle-Based**: Successful operations return handles for lifecycle management
+- **Composable**: Publishers can be chained together for filtering, caching, or relaying
+
+## Interface Definition
+
+```cpp
+class Publisher {
+ public:
+  virtual ~Publisher() = default;
+  
+  virtual folly::coro::Task<TrackStatusResult> trackStatus(const TrackStatus trackStatus);
+  virtual folly::coro::Task<SubscribeResult> subscribe(
+      SubscribeRequest sub,
+      std::shared_ptr<TrackConsumer> callback);
+  virtual folly::coro::Task<FetchResult> fetch(
+      Fetch fetch,
+      std::shared_ptr<FetchConsumer> fetchCallback);
+  virtual folly::coro::Task<SubscribeNamespaceResult> subscribeNamespace(
+      SubscribeNamespace subAnn,
+      std::shared_ptr<NamespacePublishHandle> namespacePublishHandle);
+  virtual void goaway(Goaway goaway);
+};
+```
+
+## Methods
+
+### trackStatus
+
+```cpp
+virtual folly::coro::Task<TrackStatusResult> trackStatus(
+    const TrackStatus trackStatus
+);
+```
+
+Responds to a `TRACK_STATUS_REQUEST` to indicate whether a track is available for subscription.
+
+<ParamField path="trackStatus" type="TrackStatus" required>
+  Track status request containing:
+  - `requestID`: Request identifier
+  - `trackNamespace`: Track namespace tuple
+  - `trackName`: Track name
+</ParamField>
+
+<ResponseField name="TrackStatusResult" type="folly::Expected<TrackStatusOk, TrackStatusError>">
+  On success, returns `TrackStatusOk` with track availability info. On failure, returns `TrackStatusError`.
+</ResponseField>
+
+**Default Implementation:** Returns `NOT_SUPPORTED` error.
+
+**Usage:**
+
+```cpp
+class MyPublisher : public Publisher {
+  folly::coro::Task<TrackStatusResult> trackStatus(
+      const TrackStatus trackStatus) override {
+    // Check if track exists
+    if (trackExists(trackStatus.trackNamespace, trackStatus.trackName)) {
+      TrackStatusOk ok;
+      ok.requestID = trackStatus.requestID;
+      ok.statusCode = TrackStatusCode::IN_PROGRESS;
+      ok.latestGroupID = 42;
+      co_return ok;
+    } else {
+      TrackStatusError err;
+      err.requestID = trackStatus.requestID;
+      err.statusCode = TrackStatusErrorCode::TRACK_NOT_FOUND;
+      co_return folly::makeUnexpected(err);
+    }
+  }
+};
+```
+
+### subscribe
+
+```cpp
+virtual folly::coro::Task<SubscribeResult> subscribe(
+    SubscribeRequest sub,
+    std::shared_ptr<TrackConsumer> callback
+);
+```
+
+Handles a `SUBSCRIBE` request by validating the subscription and returning a handle for managing the subscription lifecycle.
+
+<ParamField path="sub" type="SubscribeRequest" required>
+  Subscribe request containing:
+  - `requestID`: Unique request identifier
+  - `trackNamespace`: Namespace tuple (e.g., `{"conference", "room-1"}`)
+  - `trackName`: Track name (e.g., `"audio"`)
+  - `priority`: Subscriber priority (0-255)
+  - `groupOrder`: Desired group delivery order
+  - `startGroup`, `startObject`, `endGroup`, `endObject`: Range filters
+  - `params`: Optional parameters (authorization, delivery timeout, etc.)
+</ParamField>
+
+<ParamField path="callback" type="std::shared_ptr<TrackConsumer>" required>
+  Consumer that will receive objects for this subscription. The publisher writes objects to this consumer using methods like `beginSubgroup()`, `object()`, `datagram()`, etc.
+</ParamField>
+
+<ResponseField name="SubscribeResult" type="folly::Expected<std::shared_ptr<SubscriptionHandle>, SubscribeError>">
+  On success, returns a `SubscriptionHandle` for managing the subscription. On failure, returns `SubscribeError`.
+</ResponseField>
+
+**Default Implementation:** Returns `NOT_SUPPORTED` error.
+
+**Usage:**
+
+```cpp
+class MyPublisher : public Publisher {
+  folly::coro::Task<SubscribeResult> subscribe(
+      SubscribeRequest sub,
+      std::shared_ptr<TrackConsumer> callback) override {
+    
+    // Validate subscription
+    if (!trackExists(sub.trackNamespace, sub.trackName)) {
+      SubscribeError err{
+        sub.requestID,
+        SubscribeErrorCode::TRACK_NOT_FOUND,
+        "Track does not exist"
+      };
+      co_return folly::makeUnexpected(err);
+    }
+    
+    // Create handle
+    auto handle = std::make_shared<MySubscriptionHandle>(
+      sub.requestID, callback);
+    
+    // Fill in SUBSCRIBE_OK
+    SubscribeOk ok;
+    ok.requestID = sub.requestID;
+    ok.trackAlias = allocateAlias();
+    ok.groupOrder = GroupOrder::OldestFirst;
+    handle->setSubscribeOk(std::move(ok));
+    
+    // Start publishing objects to callback
+    startPublishing(handle, callback);
+    
+    co_return handle;
+  }
+};
+```
+
+### fetch
+
+```cpp
+virtual folly::coro::Task<FetchResult> fetch(
+    Fetch fetch,
+    std::shared_ptr<FetchConsumer> fetchCallback
+);
+```
+
+Handles a `FETCH` request to retrieve historical objects from a track.
+
+<ParamField path="fetch" type="Fetch" required>
+  Fetch request containing:
+  - `requestID`: Unique request identifier
+  - `trackNamespace`: Namespace tuple
+  - `trackName`: Track name
+  - `priority`: Fetch priority
+  - `groupOrder`: Group delivery order
+  - `startGroup`, `startObject`, `endGroup`, `endObject`: Range to fetch
+  - `params`: Optional parameters
+</ParamField>
+
+<ParamField path="fetchCallback" type="std::shared_ptr<FetchConsumer>" required>
+  Consumer that will receive fetched objects. Similar to `TrackConsumer` but with added backpressure support via `awaitReadyToConsume()`.
+</ParamField>
+
+<ResponseField name="FetchResult" type="folly::Expected<std::shared_ptr<FetchHandle>, FetchError>">
+  On success, returns a `FetchHandle` for managing the fetch. On failure, returns `FetchError`.
+</ResponseField>
+
+**Default Implementation:** Returns `NOT_SUPPORTED` error.
+
+**Usage:**
+
+```cpp
+class MyPublisher : public Publisher {
+  folly::coro::Task<FetchResult> fetch(
+      Fetch fetch,
+      std::shared_ptr<FetchConsumer> fetchCallback) override {
+    
+    // Validate fetch range
+    if (fetch.startGroup > fetch.endGroup) {
+      FetchError err{
+        fetch.requestID,
+        FetchErrorCode::INVALID_RANGE,
+        "Invalid group range"
+      };
+      co_return folly::makeUnexpected(err);
+    }
+    
+    // Create handle
+    auto handle = std::make_shared<MyFetchHandle>(fetch.requestID);
+    
+    // Fill in FETCH_OK
+    FetchOk ok;
+    ok.requestID = fetch.requestID;
+    ok.groupOrder = fetch.groupOrder;
+    ok.endOfTrack = false;
+    handle->setFetchOk(std::move(ok));
+    
+    // Start fetching objects
+    co_await fetchObjects(fetch, fetchCallback);
+    
+    co_return handle;
+  }
+};
+```
+
+### subscribeNamespace
+
+```cpp
+virtual folly::coro::Task<SubscribeNamespaceResult> subscribeNamespace(
+    SubscribeNamespace subAnn,
+    std::shared_ptr<NamespacePublishHandle> namespacePublishHandle
+);
+```
+
+Handles a `SUBSCRIBE_NAMESPACE` request to receive notifications about published namespaces.
+
+<ParamField path="subAnn" type="SubscribeNamespace" required>
+  Namespace subscription request containing:
+  - `requestID`: Unique request identifier
+  - `trackNamespacePrefix`: Prefix to subscribe to (e.g., `{"conference"}`)
+  - `params`: Optional parameters
+</ParamField>
+
+<ParamField path="namespacePublishHandle" type="std::shared_ptr<NamespacePublishHandle>" required>
+  Handle that will receive namespace availability notifications via:
+  - `namespaceMsg()`: Called when a namespace is published
+  - `namespaceDoneMsg()`: Called when a namespace is no longer available
+</ParamField>
+
+<ResponseField name="SubscribeNamespaceResult" type="folly::Expected<std::shared_ptr<SubscribeNamespaceHandle>, SubscribeNamespaceError>">
+  On success, returns a `SubscribeNamespaceHandle`. On failure, returns `SubscribeNamespaceError`.
+</ResponseField>
+
+**Default Implementation:** Returns `NOT_SUPPORTED` error.
+
+**Usage:**
+
+```cpp
+class MyPublisher : public Publisher {
+  folly::coro::Task<SubscribeNamespaceResult> subscribeNamespace(
+      SubscribeNamespace subAnn,
+      std::shared_ptr<NamespacePublishHandle> namespacePublishHandle) override {
+    
+    // Create handle
+    auto handle = std::make_shared<MySubscribeNamespaceHandle>(
+      subAnn.requestID, namespacePublishHandle);
+    
+    // Fill in SUBSCRIBE_NAMESPACE_OK
+    SubscribeNamespaceOk ok;
+    ok.requestID = subAnn.requestID;
+    handle->setSubscribeNamespaceOk(std::move(ok));
+    
+    // Notify about existing namespaces
+    for (const auto& ns : getMatchingNamespaces(subAnn.trackNamespacePrefix)) {
+      namespacePublishHandle->namespaceMsg(ns);
+    }
+    
+    co_return handle;
+  }
+};
+```
+
+### goaway
+
+```cpp
+virtual void goaway(Goaway goaway);
+```
+
+Notifies the publisher of a `GOAWAY` message, indicating graceful shutdown.
+
+<ParamField path="goaway" type="Goaway" required>
+  Goaway message containing optional new URI for reconnection
+</ParamField>
+
+**Default Implementation:** No-op.
+
+## Nested Handle Classes
+
+### SubscriptionHandle
+
+```cpp
+class SubscriptionHandle {
+ public:
+  virtual ~SubscriptionHandle() = default;
+  
+  virtual void unsubscribe() = 0;
+  
+  using RequestUpdateResult = folly::Expected<RequestOk, RequestError>;
+  virtual folly::coro::Task<RequestUpdateResult> requestUpdate(
+      RequestUpdate reqUpdate) = 0;
+  
+  const SubscribeOk& subscribeOk() const;
+};
+```
+
+Handle returned from successful `subscribe()` calls.
+
+#### unsubscribe
+
+```cpp
+virtual void unsubscribe() = 0;
+```
+
+Terminates the subscription, sending an `UNSUBSCRIBE` message to the peer.
+
+#### requestUpdate
+
+```cpp
+virtual folly::coro::Task<RequestUpdateResult> requestUpdate(
+    RequestUpdate reqUpdate
+) = 0;
+```
+
+Updates subscription parameters (range, priority, forward preference).
+
+<ParamField path="reqUpdate" type="RequestUpdate" required>
+  Update request containing new subscription parameters
+</ParamField>
+
+<ResponseField name="RequestUpdateResult" type="folly::Expected<RequestOk, RequestError>">
+  On success, returns `RequestOk`. On failure, returns `RequestError`.
+</ResponseField>
+
+### FetchHandle
+
+```cpp
+class FetchHandle {
+ public:
+  virtual ~FetchHandle() = default;
+  
+  virtual void fetchCancel() = 0;
+  
+  using RequestUpdateResult = folly::Expected<RequestOk, RequestError>;
+  virtual folly::coro::Task<RequestUpdateResult> requestUpdate(
+      RequestUpdate reqUpdate) = 0;
+  
+  const FetchOk& fetchOk() const;
+};
+```
+
+Handle returned from successful `fetch()` calls.
+
+#### fetchCancel
+
+```cpp
+virtual void fetchCancel() = 0;
+```
+
+Cancels the fetch operation, sending a `FETCH_CANCEL` message.
+
+#### requestUpdate
+
+```cpp
+virtual folly::coro::Task<RequestUpdateResult> requestUpdate(
+    RequestUpdate reqUpdate
+) = 0;
+```
+
+Updates fetch parameters.
+
+### SubscribeNamespaceHandle
+
+```cpp
+class SubscribeNamespaceHandle {
+ public:
+  virtual ~SubscribeNamespaceHandle() = default;
+  
+  virtual void unsubscribeNamespace() = 0;
+  
+  using RequestUpdateResult = folly::Expected<RequestOk, RequestError>;
+  virtual folly::coro::Task<RequestUpdateResult> requestUpdate(
+      RequestUpdate reqUpdate) = 0;
+  
+  const SubscribeNamespaceOk& subscribeNamespaceOk() const;
+};
+```
+
+Handle returned from successful `subscribeNamespace()` calls.
+
+#### unsubscribeNamespace
+
+```cpp
+virtual void unsubscribeNamespace() = 0;
+```
+
+Terminates the namespace subscription.
+
+### NamespacePublishHandle
+
+```cpp
+class NamespacePublishHandle {
+ public:
+  virtual ~NamespacePublishHandle() = default;
+  
+  virtual void namespaceMsg(const TrackNamespace& trackNamespaceSuffix) = 0;
+  virtual void namespaceDoneMsg(const TrackNamespace& trackNamespaceSuffix) = 0;
+};
+```
+
+Handle provided to `subscribeNamespace()` to receive namespace notifications.
+
+#### namespaceMsg
+
+```cpp
+virtual void namespaceMsg(const TrackNamespace& trackNamespaceSuffix) = 0;
+```
+
+Called when a new namespace matching the subscription is published.
+
+<ParamField path="trackNamespaceSuffix" type="TrackNamespace" required>
+  Namespace suffix relative to the subscribed prefix
+</ParamField>
+
+#### namespaceDoneMsg
+
+```cpp
+virtual void namespaceDoneMsg(const TrackNamespace& trackNamespaceSuffix) = 0;
+```
+
+Called when a namespace is no longer available.
+
+## Implementation Example
+
+```cpp
+class SimplePublisher : public Publisher {
+ private:
+  std::map<std::string, std::shared_ptr<TrackData>> tracks_;
+  
+ public:
+  folly::coro::Task<SubscribeResult> subscribe(
+      SubscribeRequest sub,
+      std::shared_ptr<TrackConsumer> callback) override {
+    
+    // Look up track
+    auto trackKey = makeKey(sub.trackNamespace, sub.trackName);
+    auto it = tracks_.find(trackKey);
+    
+    if (it == tracks_.end()) {
+      co_return folly::makeUnexpected(SubscribeError{
+        sub.requestID,
+        SubscribeErrorCode::TRACK_NOT_FOUND,
+        "Track does not exist"
+      });
+    }
+    
+    // Create handle
+    class MyHandle : public SubscriptionHandle {
+      std::weak_ptr<TrackData> track_;
+      RequestID requestID_;
+      
+     public:
+      void unsubscribe() override {
+        if (auto track = track_.lock()) {
+          track->removeSubscriber(requestID_);
+        }
+      }
+      
+      folly::coro::Task<RequestUpdateResult> requestUpdate(
+          RequestUpdate reqUpdate) override {
+        // Handle update
+        co_return RequestOk{reqUpdate.requestID};
+      }
+    };
+    
+    auto handle = std::make_shared<MyHandle>();
+    handle->track_ = it->second;
+    handle->requestID_ = sub.requestID;
+    
+    SubscribeOk ok;
+    ok.requestID = sub.requestID;
+    ok.trackAlias = allocateAlias();
+    ok.groupOrder = GroupOrder::OldestFirst;
+    handle->setSubscribeOk(std::move(ok));
+    
+    // Start publishing
+    it->second->addSubscriber(sub.requestID, callback);
+    
+    co_return handle;
+  }
+};
+```
+
+## Related Classes
+
+- [MoQSession](/api/moq-session) - Implements Publisher for network communication
+- [Subscriber](/api/subscriber) - Symmetric interface for publishers
+- [TrackConsumer](/api/track-consumer) - Receives objects from subscriptions
+- [FetchConsumer](/api/fetch-consumer) - Receives objects from fetch requests

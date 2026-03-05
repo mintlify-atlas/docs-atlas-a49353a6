@@ -1,0 +1,433 @@
+---
+title: Relay & Forwarding
+description: Building relay servers and forwarding data to multiple subscribers
+---
+
+## Overview
+
+Moxygen provides powerful components for building relay servers that forward MOQT data between multiple sessions:
+
+- **MoQRelay**: Full relay implementation with namespace routing and subscription management
+- **MoQForwarder**: Reusable fan-out component for multicasting data to multiple subscribers
+- **MoQCache**: Optional caching layer for serving historical data
+
+Relays enable scalable distribution by forwarding data from publishers to multiple subscribers without requiring direct connections.
+
+## MoQRelay Architecture
+
+`MoQRelay` implements both `Publisher` and `Subscriber` interfaces to route data between sessions.
+
+Defined in `moxygen/relay/MoQRelay.h`:
+
+```cpp
+class MoQRelay : public Publisher,
+                 public Subscriber,
+                 public MoQForwarder::Callback {
+ public:
+  explicit MoQRelay(
+      size_t maxCachedTracks = kDefaultMaxCachedTracks,
+      size_t maxCachedGroupsPerTrack = kDefaultMaxCachedGroupsPerTrack);
+
+  // Publisher interface: handle downstream subscription requests
+  folly::coro::Task<SubscribeResult> subscribe(
+      SubscribeRequest subReq,
+      std::shared_ptr<TrackConsumer> consumer) override;
+
+  folly::coro::Task<FetchResult> fetch(
+      Fetch fetch,
+      std::shared_ptr<FetchConsumer> consumer) override;
+
+  // Subscriber interface: handle upstream publishes
+  PublishResult publish(
+      PublishRequest pubReq,
+      std::shared_ptr<SubscriptionHandle> handle) override;
+
+  // Namespace routing
+  folly::coro::Task<PublishNamespaceResult> publishNamespace(
+      PublishNamespace ann,
+      std::shared_ptr<PublishNamespaceCallback> callback) override;
+
+  folly::coro::Task<SubscribeNamespaceResult> subscribeNamespace(
+      SubscribeNamespace subAnn,
+      std::shared_ptr<NamespacePublishHandle> handle) override;
+};
+```
+
+### Key Features
+
+**Namespace Tree**: Maintains hierarchical namespace structure
+- Tracks which sessions have published namespaces
+- Routes subscribe requests to appropriate publisher sessions
+- Forwards namespace availability to interested subscribers
+
+**Subscription Routing**: Maps subscriptions to upstream publishers
+- Looks up announcing session via namespace
+- Creates `MoQForwarder` to manage data flow
+- Returns consumer that writes to downstream subscribers
+
+**Caching Integration**: Optional `MoQCache` integration
+- Stores published objects in memory
+- Serves cached objects to new subscribers
+- Reduces upstream bandwidth for popular content
+
+## Namespace Routing
+
+### Publisher Announces Namespace
+
+```cpp
+// Publisher announces it can serve tracks in namespace
+PublishNamespace ann;
+ann.trackNamespace = {"conference-123", "video"};
+
+auto result = co_await publisherSession->publishNamespace(ann);
+
+// Relay stores: namespace "conference-123/video" → publisherSession
+```
+
+### Subscriber Discovers Tracks
+
+```cpp
+// Subscriber subscribes to namespace prefix
+SubscribeNamespace subAnn;
+subAnn.trackNamespacePrefix = {"conference-123"}; // All conference tracks
+subAnn.options = SubscribeNamespaceOptions::BOTH; // Existing + future tracks
+
+auto result = co_await subscriberSession->subscribeNamespace(
+    subAnn,
+    namespacePublishHandle
+);
+
+// Relay forwards namespace availability via namespacePublishHandle
+namespacePublishHandle->namespaceMsg({"conference-123", "video"});
+namespacePublishHandle->namespaceMsg({"conference-123", "audio"});
+```
+
+### Relay Forwards Subscription
+
+```cpp
+// Subscriber requests track
+SubscribeRequest subReq;
+subReq.fullTrackName = {{"conference-123", "video"}, "alice"};
+
+// Relay:
+// 1. Looks up namespace "conference-123/video" → finds publisherSession
+// 2. Creates MoQForwarder for track
+// 3. Subscribes to publisherSession if not already subscribed
+// 4. Adds subscriberSession to forwarder's subscriber list
+// 5. Returns handle that manages downstream subscription
+```
+
+### Hierarchical Namespace Matching
+
+The relay uses prefix matching:
+
+```cpp
+// Publisher announces: ["conference-123", "video", "hd"]
+// Subscriber subscribes to: ["conference-123"]
+// Match! Subscriber receives all tracks under conference-123/video/hd
+
+// Publisher announces: ["conference-456", "audio"]
+// Subscriber subscribes to: ["conference-123"]
+// No match. Subscriber doesn't receive conference-456 tracks
+```
+
+## MoQForwarder: Fan-Out Component
+
+`MoQForwarder` is a **reusable component** for multicasting data to multiple subscribers.
+
+Defined in `moxygen/relay/MoQForwarder.h`:
+
+```cpp
+class MoQForwarder : public TrackConsumer {
+ public:
+  explicit MoQForwarder(
+      FullTrackName ftn,
+      std::optional<AbsoluteLocation> largest = std::nullopt);
+
+  // Add subscriber to receive forwarded data
+  std::shared_ptr<Subscriber> addSubscriber(
+      std::shared_ptr<MoQSession> session,
+      const SubscribeRequest& subReq,
+      std::shared_ptr<TrackConsumer> consumer);
+
+  // TrackConsumer interface: receives data from upstream
+  folly::Expected<std::shared_ptr<SubgroupConsumer>, MoQPublishError>
+  beginSubgroup(
+      uint64_t groupID,
+      uint64_t subgroupID,
+      Priority priority,
+      bool containsLastInGroup) override;
+
+  folly::Expected<folly::Unit, MoQPublishError> objectStream(
+      const ObjectHeader& header,
+      Payload payload,
+      bool lastInGroup) override;
+
+  folly::Expected<folly::Unit, MoQPublishError> datagram(
+      const ObjectHeader& header,
+      Payload payload,
+      bool lastInGroup) override;
+
+  folly::Expected<folly::Unit, MoQPublishError> publishDone(
+      PublishDone pubDone) override;
+};
+```
+
+### Subscription Management
+
+Each subscriber has its own state:
+
+```cpp
+struct Subscriber : public Publisher::SubscriptionHandle {
+  std::shared_ptr<MoQSession> session;
+  RequestID requestID;
+  SubscribeRange range;  // Which objects to receive
+  std::shared_ptr<TrackConsumer> trackConsumer;
+  
+  // Open subgroups for this subscriber
+  SubgroupConsumerMap subgroups;
+  
+  bool shouldForward;  // Forward preference
+  bool receivedPublishDone_;  // Draining state
+};
+```
+
+The forwarder:
+- **Tracks each subscriber's session, request ID, range, and consumer**
+- **Filters objects** based on each subscriber's range and forward preference
+- **Handles per-subscriber backpressure** and errors
+- **Gracefully drains subscribers** when upstream completes
+
+### Flow Control in Forwarder
+
+**Payload Cloning**: Objects are cloned for each subscriber
+
+```cpp
+static Payload maybeClone(const Payload& payload) {
+  if (payload.index() == 0) {
+    // IOBuf - must clone for multiple subscribers
+    return std::get<0>(payload)->clone();
+  }
+  // PayloadHandle - can be shared (reference counted)
+  return payload;
+}
+```
+
+**Subgroup Management**: Opens subgroups on-demand for each subscriber
+
+```cpp
+folly::Expected<std::shared_ptr<SubgroupConsumer>, MoQPublishError>
+MoQForwarder::beginSubgroup(
+    uint64_t groupID,
+    uint64_t subgroupID,
+    Priority priority,
+    bool containsLastInGroup) {
+  
+  // For each subscriber in range
+  for (auto& [session, sub] : subscribers_) {
+    if (!checkRange(*sub)) continue;
+    
+    // Open subgroup on subscriber's consumer
+    auto result = sub->trackConsumer->beginSubgroup(
+        groupID, subgroupID, priority, containsLastInGroup
+    );
+    
+    if (result.hasError()) {
+      // Handle per-subscriber errors
+      handleSubgroupError(*sub, {groupID, subgroupID}, result.error());
+      continue;
+    }
+    
+    // Store subgroup consumer
+    sub->subgroups[{groupID, subgroupID}] = result.value();
+  }
+  
+  // Return SubgroupForwarder to forward objects to all subscribers
+  return std::make_shared<SubgroupForwarder>(*this, groupID, subgroupID, priority);
+}
+```
+
+**Error Handling**: Subscribers are removed on fatal errors
+
+```cpp
+void MoQForwarder::handleSubgroupError(
+    Subscriber& sub,
+    const SubgroupIdentifier& subgroupId,
+    const MoQPublishError& err,
+    const std::string& callsite) {
+  
+  if (err.errorCode == MoQPublishError::CANCELLED) {
+    // Soft error (STOP_SENDING or delivery timeout)
+    // Tombstone subgroup but keep subscription alive
+    sub.subgroups[subgroupId] = nullptr;
+  } else {
+    // Hard error - remove entire subscription
+    removeSubscriber(sub.session, std::nullopt, callsite);
+  }
+}
+```
+
+### Using MoQForwarder Outside Relay
+
+Publishers can use `MoQForwarder` directly for multicast:
+
+```cpp
+auto forwarder = std::make_shared<MoQForwarder>(
+    FullTrackName{{"conference-123", "video"}, "alice"}
+);
+
+// Add subscribers as they arrive
+forwarder->addSubscriber(session1, subscribeReq1, consumer1);
+forwarder->addSubscriber(session2, subscribeReq2, consumer2);
+
+// Publish data once, forwarded to all
+auto subgroup = forwarder->beginSubgroup(0, 0, 128).value();
+subgroup->object(0, payload, extensions);
+subgroup->object(1, payload2, extensions);
+subgroup->endOfSubgroup();
+
+// Signal completion
+forwarder->publishDone(PublishDone{...});
+```
+
+## Multi-Hop Delivery
+
+Relays can be chained for multi-hop delivery:
+
+```
+Publisher → Relay 1 → Relay 2 → Relay 3 → Subscriber
+```
+
+**Example Scenario**: Global CDN
+
+1. **Origin Publisher** (US-East)
+   - Publishes track `["cdn", "video"], "stream123"`
+   - Announces namespace `["cdn", "video"]`
+
+2. **Regional Relay** (US-West)
+   - Subscribes to namespace `["cdn"]` from origin
+   - Receives announcement for `["cdn", "video"]`
+   - Subscribes to `stream123` when local subscriber connects
+   - Forwards data to local subscribers
+
+3. **Edge Relay** (San Francisco)
+   - Subscribes to namespace `["cdn"]` from regional relay
+   - Forwards data to end users
+
+**Forward Preference**: Controls how relays forward data
+
+```cpp
+subReq.forward = true;  // Relay can forward to other relays
+subReq.forward = false; // End subscriber, don't forward further
+```
+
+The forwarder tracks `forwardingSubscribers_` count:
+
+```cpp
+void MoQForwarder::addForwardingSubscriber() {
+  forwardingSubscribers_++;
+  if (callback_) {
+    callback_->forwardChanged(this);
+  }
+}
+
+uint64_t numForwardingSubscribers() const {
+  return forwardingSubscribers_;
+}
+```
+
+Relays use this to decide whether to keep upstream subscriptions alive.
+
+## Real-World Example: Building a Relay Server
+
+```cpp
+#include <moxygen/MoQServer.h>
+#include <moxygen/relay/MoQRelay.h>
+
+class MyRelayServer {
+ public:
+  void start() {
+    // Create relay with caching
+    relay_ = std::make_shared<MoQRelay>(
+        /*maxCachedTracks=*/100,
+        /*maxCachedGroupsPerTrack=*/10
+    );
+    
+    // Set allowed namespace prefix (authorization)
+    relay_->setAllowedNamespacePrefix({"conference"});
+    
+    // Create server
+    MoQServer::Config config;
+    config.address = folly::SocketAddress("0.0.0.0", 4433);
+    config.cert = loadCertificate();
+    config.key = loadPrivateKey();
+    
+    server_ = std::make_unique<MoQServer>(config);
+    
+    // Set session handler
+    server_->setSessionHandler([this](std::shared_ptr<MoQSession> session) {
+      // Connect session to relay
+      session->setPublishHandler(relay_);
+      session->setSubscribeHandler(relay_);
+      
+      XLOG(INFO) << "New session from " << session->getPeerAddress();
+    });
+    
+    // Start accepting connections
+    server_->start();
+  }
+
+ private:
+  std::shared_ptr<MoQRelay> relay_;
+  std::unique_ptr<MoQServer> server_;
+};
+```
+
+## Performance Considerations
+
+### Memory Usage
+
+**Object Cloning**: Each subscriber gets a cloned payload
+- Use `PayloadHandle` (reference counted) instead of `IOBuf` when possible
+- Cache frequently accessed objects in `MoQCache`
+
+**Subgroup State**: Open subgroups consume memory
+- Close subgroups promptly with `endOfSubgroup()`
+- Use appropriate `containsLastInGroup` hints
+
+### CPU Usage
+
+**Per-Subscriber Overhead**: Each object is processed per subscriber
+- Filter subscribers by range early
+- Remove failed subscribers promptly
+
+**Namespace Lookups**: Prefix matching can be expensive
+- Use flat namespaces when possible
+- Limit namespace depth
+
+### Network Bandwidth
+
+**Upstream Subscriptions**: Relay subscribes once, serves many
+- Use `MoQForwarder::numForwardingSubscribers()` to track demand
+- Unsubscribe upstream when no downstream subscribers remain
+
+**Downstream Errors**: Failed subscribers waste bandwidth
+- Monitor `TOO_FAR_BEHIND` errors
+- Implement subscriber health checks
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Flow Control" icon="gauge-high" href="/concepts/flow-control">
+    Manage backpressure in relay scenarios
+  </Card>
+  <Card title="MoQCache" icon="database" href="/api-reference/classes/moqcache">
+    Add caching to your relay
+  </Card>
+  <Card title="Sample Relay" icon="code" href="/examples/relay-server">
+    Complete relay server example
+  </Card>
+  <Card title="Performance Tuning" icon="gauge" href="/guides/performance">
+    Optimize relay performance
+  </Card>
+</CardGroup>

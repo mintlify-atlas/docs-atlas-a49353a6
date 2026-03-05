@@ -1,0 +1,238 @@
+---
+title: "MoQRelay"
+description: "Relay implementation for routing subscriptions and publishes between MOQT sessions"
+---
+
+## Overview
+
+`MoQRelay` is a complete relay implementation that routes subscriptions and publishes between MOQT sessions. It implements both `Publisher` and `Subscriber` interfaces, enabling it to accept connections from both publishers and subscribers while managing namespace-based routing.
+
+**Source**: `moxygen/relay/MoQRelay.h`
+
+## Key Features
+
+<CardGroup cols={2}>
+  <Card title="Namespace Routing" icon="route">
+    Hierarchical namespace tree for tracking and routing track namespaces
+  </Card>
+  <Card title="Object Caching" icon="database">
+    Optional integration with MoQCache for serving historical data
+  </Card>
+  <Card title="Fan-Out" icon="share-nodes">
+    Uses MoQForwarder for efficient multi-subscriber data distribution
+  </Card>
+  <Card title="Dynamic Discovery" icon="magnifying-glass">
+    SUBSCRIBE_NAMESPACE and PUBLISH_NAMESPACE for track discovery
+  </Card>
+</CardGroup>
+
+## Constructor
+
+```cpp MoQRelay.h
+explicit MoQRelay(
+    size_t maxCachedTracks = kDefaultMaxCachedTracks,
+    size_t maxCachedGroupsPerTrack = kDefaultMaxCachedGroupsPerTrack);
+```
+
+<ParamField path="maxCachedTracks" type="size_t" default="100">
+  Maximum number of tracks to cache. Set to 0 to disable caching.
+</ParamField>
+
+<ParamField path="maxCachedGroupsPerTrack" type="size_t" default="3">
+  Maximum number of groups to cache per track.
+</ParamField>
+
+## Core Methods
+
+### setAllowedNamespacePrefix
+
+Sets a namespace prefix filter for access control.
+
+```cpp
+void setAllowedNamespacePrefix(TrackNamespace allowed);
+```
+
+<ParamField path="allowed" type="TrackNamespace">
+  Only namespaces matching this prefix will be allowed.
+</ParamField>
+
+### subscribe
+
+Handles incoming SUBSCRIBE requests from downstream clients.
+
+```cpp
+folly::coro::Task<SubscribeResult> subscribe(
+    SubscribeRequest subReq,
+    std::shared_ptr<TrackConsumer> consumer) override;
+```
+
+**Flow**:
+1. Look up the publisher session via namespace tree
+2. Create or retrieve MoQForwarder for the track
+3. Add the requesting session as a subscriber to the forwarder
+4. If this is the first subscriber, forward the subscription upstream
+
+### fetch
+
+Handles FETCH requests for historical data.
+
+```cpp
+folly::coro::Task<FetchResult> fetch(
+    Fetch fetch,
+    std::shared_ptr<FetchConsumer> consumer) override;
+```
+
+If caching is enabled, serves cached objects and fetches missing ranges from upstream.
+
+### publishNamespace
+
+Handles PUBLISH_NAMESPACE requests from publishers.
+
+```cpp
+folly::coro::Task<Subscriber::PublishNamespaceResult> publishNamespace(
+    PublishNamespace ann,
+    std::shared_ptr<Subscriber::PublishNamespaceCallback>) override;
+```
+
+**Flow**:
+1. Create or update namespace node in the tree
+2. Store the publisher session
+3. Forward namespace availability to interested subscribers
+
+### subscribeNamespace
+
+Handles SUBSCRIBE_NAMESPACE requests from subscribers.
+
+```cpp
+folly::coro::Task<SubscribeNamespaceResult> subscribeNamespace(
+    SubscribeNamespace subAnn,
+    std::shared_ptr<NamespacePublishHandle> namespacePublishHandle) override;
+```
+
+**Flow**:
+1. Register the subscriber for the namespace prefix
+2. Send existing matching namespaces to the subscriber
+3. Forward future matching PUBLISH_NAMESPACE messages
+
+### publish
+
+Handles PUBLISH requests (draft 16+).
+
+```cpp
+PublishResult publish(
+    PublishRequest pubReq,
+    std::shared_ptr<Publisher::SubscriptionHandle> handle = nullptr) override;
+```
+
+Registers the publishing session for the track and returns a consumer for receiving objects.
+
+## Helper Methods
+
+### findPublishNamespaceSession
+
+Finds the session that published a given namespace.
+
+```cpp
+std::shared_ptr<MoQSession> findPublishNamespaceSession(
+    const TrackNamespace& ns);
+```
+
+<ResponseField name="return" type="std::shared_ptr<MoQSession>">
+  The session that published the namespace, or nullptr if not found.
+</ResponseField>
+
+## Architecture
+
+### Namespace Tree
+
+The relay maintains a hierarchical tree of namespace nodes:
+
+```cpp
+struct NamespaceNode {
+  TrackNamespace trackNamespace_;
+  
+  // Child namespaces
+  folly::F14FastMap<std::string, std::shared_ptr<NamespaceNode>> children;
+  
+  // Tracks published at this namespace
+  folly::F14FastMap<std::string, std::shared_ptr<MoQSession>> publishes;
+  
+  // Sessions subscribed to this namespace prefix
+  folly::F14FastMap<std::shared_ptr<MoQSession>, NamespaceSubscriberInfo> sessions;
+  
+  // Active PUBLISH_NAMESPACE handles
+  folly::F14FastMap<
+    std::shared_ptr<MoQSession>,
+    std::shared_ptr<PublishNamespaceHandle>> namespacesPublished;
+};
+```
+
+### Subscription Management
+
+Each active subscription is tracked in a `RelaySubscription`:
+
+```cpp
+struct RelaySubscription {
+  std::shared_ptr<MoQForwarder> forwarder;  // Fan-out forwarder
+  std::shared_ptr<MoQSession> upstream;     // Upstream publisher
+  RequestID requestID;
+  std::shared_ptr<Publisher::SubscriptionHandle> handle;
+};
+```
+
+## Usage Example
+
+```cpp relay_example.cpp
+#include <moxygen/relay/MoQRelay.h>
+#include <moxygen/MoQServer.h>
+
+auto relay = std::make_shared<MoQRelay>(
+  /* maxCachedTracks */ 100,
+  /* maxCachedGroupsPerTrack */ 3
+);
+
+// Optional: restrict to specific namespace
+relay->setAllowedNamespacePrefix({"live-streams"});
+
+// Create server and set relay as handler
+auto server = std::make_shared<MoQServer>(
+  eventBase,
+  certFile,
+  keyFile
+);
+
+server->setSessionFactory([relay](auto wt, auto exec) {
+  auto session = std::make_shared<MoQRelaySession>(wt, exec);
+  session->setPublishHandler(relay);
+  session->setSubscribeHandler(relay);
+  return session;
+});
+
+server->start(bindAddress, 4433);
+```
+
+## Caching Integration
+
+When caching is enabled, the relay wraps consumers with cache writebacks:
+
+```cpp
+std::shared_ptr<TrackConsumer> getSubscribeWriteback(
+    const FullTrackName& ftn,
+    std::shared_ptr<TrackConsumer> consumer);
+```
+
+Objects received from upstream publishers are automatically cached and served to future subscribers.
+
+## Related Classes
+
+<CardGroup cols={3}>
+  <Card title="MoQForwarder" href="/api/moq-forwarder">
+    Fan-out component used by relay
+  </Card>
+  <Card title="MoQCache" href="/api/moq-cache">
+    Object caching implementation
+  </Card>
+  <Card title="MoQRelaySession" href="/api/moq-relay-session">
+    Session with namespace support
+  </Card>
+</CardGroup>

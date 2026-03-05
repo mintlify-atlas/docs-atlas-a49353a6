@@ -1,97 +1,146 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "Moxygen"
+description: "C++ library for implementing MOQT (Media over QUIC Transport) applications"
 ---
 
-## Setting up
+<div style={{
+  background: 'linear-gradient(135deg, #fcd554 0%, #fce386 100%)',
+  padding: '4rem 2rem',
+  borderRadius: '8px',
+  marginBottom: '3rem',
+  textAlign: 'center'
+}}>
+  <h1 style={{
+    fontSize: '3rem',
+    fontWeight: 700,
+    color: '#1a1a1a',
+    marginBottom: '1rem'
+  }}>
+    Build Real-Time Media Applications with MOQT
+  </h1>
+  <p style={{
+    fontSize: '1.25rem',
+    color: '#1a1a1a',
+    maxWidth: '800px',
+    margin: '0 auto'
+  }}>
+    A complete C++ implementation of the MOQT protocol with symmetric Publisher/Subscriber APIs, transport-agnostic design, and built-in relay capabilities
+  </p>
+</div>
 
-Get your documentation site up and running in minutes.
+## Get Started
 
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Installation" icon="download" href="/installation">
+    Build moxygen and set up your development environment
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Create your first publisher and subscriber in minutes
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Architecture" icon="sitemap" href="/concepts/architecture">
+    Understand the core components and design principles
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="Sample Applications" icon="flask" href="/samples/overview">
+    Explore working examples including date server, chat, and media streaming
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## Key Features
 
-Everything you need to create world-class documentation.
+<CardGroup cols={2}>
+  <Card title="Symmetric APIs" icon="arrows-rotate">
+    Publisher and Subscriber interfaces are symmetric, enabling easy chaining for filtering, proxying, and relay scenarios
+  </Card>
+  <Card title="Transport Agnostic" icon="network-wired">
+    Works over HTTP/3 WebTransport, native QUIC, or alternative implementations via the WebTransport interface
+  </Card>
+  <Card title="Relay & Forwarding" icon="share-nodes">
+    Built-in support for namespace routing, multi-hop delivery, and object caching
+  </Card>
+  <Card title="Media Streaming" icon="video">
+    Complete media streaming support with MoqMi packaging and FLV format integration
+  </Card>
+  <Card title="Flow Control" icon="gauge-high">
+    Multi-level backpressure management at transport, session, and application layers
+  </Card>
+  <Card title="Async/Await" icon="clock">
+    Coroutine-based async APIs using Folly for clean, efficient asynchronous code
+  </Card>
+</CardGroup>
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+## Core Capabilities
 
-## Need inspiration?
+<Accordion title="Complete MOQT Protocol Implementation">
+  Moxygen implements the full MOQT (Media over QUIC Transport) specification with support for SUBSCRIBE, FETCH, PUBLISH_NAMESPACE, and all control plane operations. Version negotiation and protocol extensions are built-in.
+</Accordion>
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+<Accordion title="Flexible Component Architecture">
+  The symmetric Publisher/Subscriber design enables powerful composition patterns. Build filters, relays, caches, and transcoders by implementing consumer interfaces to receive data and publisher interfaces to serve data downstream.
+</Accordion>
+
+<Accordion title="Production-Ready Relay">
+  MoQRelay provides namespace routing, subscription management, and optional object caching. MoQForwarder handles fan-out data forwarding with per-subscriber filtering and backpressure control.
+</Accordion>
+
+<Accordion title="Real-World Media Support">
+  Includes FLV parser, MoqMi media packaging, and sample applications for streaming video/audio over MOQT. Integrate with ffmpeg for broadcast-quality live streaming.
+</Accordion>
+
+## Quick Example
+
+```cpp example.cpp
+#include <moxygen/MoQClient.h>
+#include <moxygen/MoQSession.h>
+
+// Create a MOQT client and connect
+auto client = std::make_shared<MoQClient>(evb);
+auto session = co_await client->connect(
+  proxygen::URL("https://relay.example.com:4433/moq"),
+  settings
+);
+
+// Set up the session
+co_await session->setup(/* role */ moxygen::Role::PUBLISHER);
+
+// Subscribe to a track
+auto subscribeResult = co_await session->subscribe(
+  SubscribeRequest{
+    .requestID = 1,
+    .trackNamespace = "live-stream",
+    .trackName = "video",
+    .startLocation = AbsoluteLocation{0, 0}
+  },
+  consumer
+);
+```
+
+## Use Cases
+
+<CardGroup cols={2}>
+  <Card title="Live Streaming" icon="tower-broadcast">
+    Build ultra-low latency live streaming platforms with control over latency, quality, and scale
+  </Card>
+  <Card title="Video Conferencing" icon="users-viewfinder">
+    Implement real-time video calls with MOQT's efficient group communication patterns
+  </Card>
+  <Card title="Content Distribution" icon="globe">
+    Deploy relay networks for scalable media distribution across geographic regions
+  </Card>
+  <Card title="IoT & Telemetry" icon="satellite-dish">
+    Stream sensor data and telemetry with efficient publish/subscribe patterns
+  </Card>
+</CardGroup>
+
+## Next Steps
+
+<CardGroup cols={3}>
+  <Card title="Core Concepts" icon="lightbulb" href="/concepts/architecture">
+    Learn about the architecture and key components
+  </Card>
+  <Card title="Build a Publisher" icon="tower-broadcast" href="/guides/building-publisher">
+    Create your first MOQT publisher application
+  </Card>
+  <Card title="API Reference" icon="code" href="/api/moq-session">
+    Explore the complete API documentation
+  </Card>
+</CardGroup>

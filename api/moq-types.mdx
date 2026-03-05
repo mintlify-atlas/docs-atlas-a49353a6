@@ -1,0 +1,467 @@
+---
+title: "MoQTypes"
+description: "Core MOQT protocol types, messages, and error codes"
+---
+
+## Overview
+
+`MoQTypes.h` defines all core types, structures, and enums used in the MOQT protocol. This includes request/response messages, error codes, track identifiers, and protocol constants.
+
+**Source**: `moxygen/MoQTypes.h`
+
+## Core Type Aliases
+
+```cpp
+using Payload = std::unique_ptr<folly::IOBuf>;
+using Priority = uint8_t;
+```
+
+<ParamField path="Payload" type="std::unique_ptr<folly::IOBuf>">
+  Object payload data - zero-copy IOBuf chain
+</ParamField>
+
+<ParamField path="Priority" type="uint8_t">
+  Stream priority (0-255, lower is higher priority)
+</ParamField>
+
+## Track Identifiers
+
+### TrackNamespace
+
+```cpp
+using TrackNamespace = std::vector<std::string>;
+
+// Example:
+TrackNamespace ns{"live-streams", "sports", "soccer"};
+```
+
+Hierarchical namespace for organizing tracks.
+
+### FullTrackName
+
+```cpp
+struct FullTrackName {
+  TrackNamespace trackNamespace;
+  std::string trackName;
+  
+  struct hash {
+    size_t operator()(const FullTrackName& ftn) const;
+  };
+};
+
+// Example:
+FullTrackName ftn{
+  .trackNamespace = {"live-stream"},
+  .trackName = "video"
+};
+```
+
+### TrackAlias
+
+```cpp
+using TrackAlias = uint64_t;
+```
+
+Numeric alias for a track (set by publisher, used in object headers).
+
+## Location Types
+
+### AbsoluteLocation
+
+```cpp
+struct AbsoluteLocation {
+  uint64_t group;
+  uint64_t object;
+  
+  bool operator<(const AbsoluteLocation& other) const;
+  bool operator==(const AbsoluteLocation& other) const;
+};
+```
+
+Identifies a specific object by group and object ID.
+
+### SubscribeRange
+
+```cpp
+struct SubscribeRange {
+  std::variant<
+    AbsoluteLocation,    // Start from specific object
+    LatestGroup,         // Start from latest group
+    LatestObject         // Start from latest object
+  > start;
+  
+  std::optional<AbsoluteLocation> end;  // Optional end location
+};
+```
+
+Defines the range of objects for a subscription.
+
+## Request Messages
+
+### SubscribeRequest
+
+```cpp
+struct SubscribeRequest {
+  RequestID requestID;
+  TrackAlias trackAlias;
+  TrackNamespace trackNamespace;
+  std::string trackName;
+  SubscribeRange range;
+  FilterType filter;                          // LatestGroup, LatestObject, AbsoluteStart, AbsoluteRange
+  std::optional<GroupOrder> groupOrder;
+  Parameters parameters;                      // Extensions
+};
+```
+
+### Fetch
+
+```cpp
+struct Fetch {
+  RequestID requestID;
+  TrackAlias trackAlias;
+  TrackNamespace trackNamespace;
+  std::string trackName;
+  AbsoluteLocation start;
+  std::optional<AbsoluteLocation> end;
+  std::optional<GroupOrder> groupOrder;
+  Parameters parameters;
+};
+```
+
+### PublishRequest
+
+```cpp
+struct PublishRequest {
+  RequestID requestID;
+  TrackNamespace trackNamespace;
+  std::string trackName;
+  bool forward;                               // Forward preference
+  Parameters parameters;
+};
+```
+
+### PublishNamespace
+
+```cpp
+struct PublishNamespace {
+  RequestID requestID;
+  TrackNamespace trackNamespacePrefix;
+  Parameters parameters;
+};
+```
+
+### SubscribeNamespace
+
+```cpp
+struct SubscribeNamespace {
+  RequestID requestID;
+  TrackNamespace trackNamespacePrefix;
+  Parameters parameters;
+};
+```
+
+## Response Messages
+
+### SubscribeOk
+
+```cpp
+struct SubscribeOk {
+  RequestID requestID;
+  std::chrono::milliseconds expires;          // Subscription duration
+  std::optional<AbsoluteLocation> largest;    // Largest available object
+  Extensions extensions;
+};
+```
+
+### FetchOk
+
+```cpp
+struct FetchOk {
+  RequestID requestID;
+  std::optional<GroupOrder> groupOrder;
+  std::optional<AbsoluteLocation> endOfTrack;
+  Extensions extensions;
+};
+```
+
+### PublishOk
+
+```cpp
+struct PublishOk {
+  RequestID requestID;
+};
+```
+
+### PublishNamespaceOk
+
+```cpp
+struct PublishNamespaceOk {
+  RequestID requestID;
+};
+```
+
+### SubscribeNamespaceOk
+
+```cpp
+struct SubscribeNamespaceOk {
+  RequestID requestID;
+};
+```
+
+## Error Types
+
+### SubscribeError
+
+```cpp
+struct SubscribeError {
+  RequestID requestID;
+  SubscribeErrorCode code;
+  std::string reasonPhrase;
+};
+
+enum class SubscribeErrorCode : uint32_t {
+  INTERNAL_ERROR = 0,
+  INVALID_RANGE = 1,
+  RETRY_TRACK_ALIAS = 2,
+  TRACK_NOT_EXIST = 3,
+  UNAUTHORIZED = 4,
+  TIMEOUT = 5,
+  NOT_SUPPORTED = 6
+};
+```
+
+### FetchError
+
+```cpp
+struct FetchError {
+  RequestID requestID;
+  FetchErrorCode code;
+  std::string reasonPhrase;
+};
+
+enum class FetchErrorCode : uint32_t {
+  INTERNAL_ERROR = 0,
+  INVALID_RANGE = 1,
+  TRACK_NOT_EXIST = 2,
+  UNAUTHORIZED = 3,
+  TIMEOUT = 4,
+  NOT_SUPPORTED = 5
+};
+```
+
+### PublishError
+
+```cpp
+struct PublishError {
+  RequestID requestID;
+  PublishErrorCode code;
+  std::string reasonPhrase;
+};
+
+enum class PublishErrorCode : uint32_t {
+  INTERNAL_ERROR = 0,
+  TRACK_ALREADY_EXISTS = 1,
+  UNAUTHORIZED = 2,
+  TIMEOUT = 3,
+  NOT_SUPPORTED = 4
+};
+```
+
+### RequestError
+
+```cpp
+struct RequestError {
+  RequestID requestID;
+  RequestErrorCode code;
+  std::string reasonPhrase;
+};
+
+enum class RequestErrorCode : uint32_t {
+  INVALID_RANGE = 0,
+  NOT_SUPPORTED = 1
+};
+```
+
+## Object Headers
+
+### ObjectHeader
+
+```cpp
+struct ObjectHeader {
+  uint64_t group;
+  uint64_t object;
+  uint64_t length;                  // Payload length
+  Priority priority;
+  ForwardingPreference forwardingPreference;  // Track, Subgroup, Datagram
+  ObjectStatus status;              // Normal, EndOfGroup, EndOfTrackAndGroup
+};
+```
+
+### ObjectStatus
+
+```cpp
+enum class ObjectStatus : uint64_t {
+  NORMAL = 0,
+  OBJECT_NOT_EXIST = 1,
+  GROUP_NOT_EXIST = 2,
+  END_OF_GROUP = 3,
+  END_OF_TRACK_AND_GROUP = 4,
+  END_OF_SUBGROUP = 5
+};
+```
+
+### ForwardingPreference
+
+```cpp
+enum class ForwardingPreference : uint8_t {
+  Track = 0,     // Stream per track
+  Subgroup = 1,  // Stream per subgroup  
+  Datagram = 2   // Datagrams
+};
+```
+
+## Session Management
+
+### Goaway
+
+```cpp
+struct Goaway {
+  std::string newSessionUri;  // Redirect URI (empty = shutdown)
+};
+```
+
+### PublishDone
+
+```cpp
+struct PublishDone {
+  RequestID requestID;
+  PublishDoneStatusCode statusCode;
+  std::string reasonPhrase;
+};
+
+enum class PublishDoneStatusCode : uint32_t {
+  INTERNAL_ERROR = 0,
+  UNAUTHORIZED = 1,
+  TRACK_ENDED = 2,
+  SUBSCRIPTION_ENDED = 3,
+  GOING_AWAY = 4,
+  EXPIRED = 5,
+  TOO_FAR_BEHIND = 6,
+  UPDATE_FAILED = 8
+};
+```
+
+## Extensions
+
+```cpp
+using Extensions = std::vector<std::pair<uint64_t, Payload>>;
+using Parameters = Extensions;  // Alias
+```
+
+### Extension Type Constants
+
+```cpp
+// Object-level extensions
+const uint64_t kImmutableExtensionType = 0xB;
+const uint64_t kPriorGroupIdGapExtensionType = 0x3C;
+const uint64_t kPriorObjectIdGapExtensionType = 0x3E;
+
+// Track property extensions (Draft-16+)
+const uint64_t kDeliveryTimeoutExtensionType = 0x02;
+const uint64_t kMaxCacheDurationExtensionType = 0x04;
+const uint64_t kPublisherPriorityExtensionType = 0x0E;
+const uint64_t kPublisherGroupOrderExtensionType = 0x22;
+const uint64_t kDynamicGroupsExtensionType = 0x30;
+```
+
+## Group Order
+
+```cpp
+enum class GroupOrder : uint8_t {
+  OldestFirst = 0,    // Ascending group IDs
+  NewestFirst = 1     // Descending group IDs
+};
+```
+
+## Session Close Errors
+
+```cpp
+enum class SessionCloseErrorCode : uint32_t {
+  NO_ERROR = 0,
+  INTERNAL_ERROR = 1,
+  UNAUTHORIZED = 2,
+  PROTOCOL_VIOLATION = 3,
+  INVALID_REQUEST_ID = 4,
+  DUPLICATE_TRACK_ALIAS = 5,
+  TOO_MANY_REQUESTS = 7,
+  GOAWAY_TIMEOUT = 0x10,
+  VERSION_NEGOTIATION_FAILED = 0x15
+};
+```
+
+## Constants
+
+```cpp
+const size_t kMaxNamespaceLength = 32;  // Max namespace components
+const uint8_t kDefaultPriority = 128;    // Default stream priority
+const uint64_t kEightByteLimit = 0x3FFFFFFFFFFFFFFF;  // Max varint value
+```
+
+## Usage Examples
+
+### Creating a Subscribe Request
+
+```cpp subscribe_example.cpp
+SubscribeRequest subReq{
+  .requestID = 1,
+  .trackAlias = 0,  // Will be set by session
+  .trackNamespace = {"live-stream"},
+  .trackName = "video",
+  .range = {
+    .start = LatestGroup{},
+    .end = std::nullopt  // Subscribe to end
+  },
+  .filter = FilterType::LatestGroup,
+  .groupOrder = GroupOrder::OldestFirst,
+  .parameters = {}
+};
+```
+
+### Creating a Fetch Request
+
+```cpp fetch_example.cpp
+Fetch fetchReq{
+  .requestID = 2,
+  .trackAlias = 0,
+  .trackNamespace = {"vod"},
+  .trackName = "video",
+  .start = AbsoluteLocation{/* group */ 0, /* object */ 0},
+  .end = AbsoluteLocation{/* group */ 100, /* object */ 0},
+  .groupOrder = GroupOrder::OldestFirst,
+  .parameters = {}
+};
+```
+
+### Working with Extensions
+
+```cpp extensions_example.cpp
+Extensions extensions{
+  {kDeliveryTimeoutExtensionType, encodeVarInt(3000)},  // 3 second timeout
+  {kPublisherPriorityExtensionType, encodeVarInt(128)},  // Default priority
+  {kPublisherGroupOrderExtensionType, encodeVarInt(GroupOrder::OldestFirst)}
+};
+```
+
+## Related Classes
+
+<CardGroup cols={3}>
+  <Card title="MoQSession" href="/api/moq-session">
+    Uses these types for protocol operations
+  </Card>
+  <Card title="Publisher" href="/api/publisher">
+    Request/response types
+  </Card>
+  <Card title="Subscriber" href="/api/subscriber">
+    Request/response types
+  </Card>
+</CardGroup>

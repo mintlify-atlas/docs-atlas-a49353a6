@@ -1,0 +1,294 @@
+---
+title: "MoQCache"
+description: "Object caching implementation for serving historical data to new subscribers"
+---
+
+## Overview
+
+`MoQCache` stores published objects in memory and serves them to new subscribers requesting historical data. It integrates with `MoQRelay` to provide caching capabilities and supports FETCH requests with intelligent upstream coalescing.
+
+**Source**: `moxygen/relay/MoQCache.h`
+
+## Key Features
+
+<CardGroup cols={2}>
+  <Card title="LRU Eviction" icon="rotate">
+    Automatic eviction of oldest tracks and groups when limits are reached
+  </Card>
+  <Card title="Fetch Coalescing" icon="merge">
+    Multiple concurrent fetches for the same range share a single upstream request
+  </Card>
+  <Card title="Writeback Filtering" icon="filter">
+    Wraps consumers to cache objects as they're received
+  </Card>
+  <Card title="Time-Based Expiry" icon="clock">
+    Configurable max cache duration per track
+  </Card>
+</CardGroup>
+
+## Constructor
+
+```cpp MoQCache.h
+explicit MoQCache(
+    size_t maxCachedTracks = kDefaultMaxCachedTracks,
+    size_t maxCachedGroupsPerTrack = kDefaultMaxCachedGroupsPerTrack);
+```
+
+<ParamField path="maxCachedTracks" type="size_t" default="100">
+  Maximum number of tracks to cache
+</ParamField>
+
+<ParamField path="maxCachedGroupsPerTrack" type="size_t" default="3">
+  Maximum number of groups to cache per track
+</ParamField>
+
+<Note>
+Default constants: `kDefaultMaxCachedTracks = 100`, `kDefaultMaxCachedGroupsPerTrack = 3`
+</Note>
+
+## Core Methods
+
+### getSubscribeWriteback
+
+Returns a filter that caches objects as they're received from upstream.
+
+```cpp
+std::shared_ptr<TrackConsumer> getSubscribeWriteback(
+    const FullTrackName& ftn,
+    std::shared_ptr<TrackConsumer> consumer);
+```
+
+<ParamField path="ftn" type="const FullTrackName&">
+  The track being subscribed to
+</ParamField>
+
+<ParamField path="consumer" type="std::shared_ptr<TrackConsumer>">
+  The downstream consumer to pass objects to
+</ParamField>
+
+<ResponseField name="return" type="std::shared_ptr<TrackConsumer>">
+  A wrapped consumer that caches objects before forwarding
+</ResponseField>
+
+**Usage in relay**:
+```cpp
+auto cachedConsumer = cache_->getSubscribeWriteback(ftn, consumer);
+co_await upstream->subscribe(subReq, cachedConsumer);
+```
+
+### fetch
+
+Serves a FETCH request from cache, fetching missing ranges from upstream.
+
+```cpp
+folly::coro::Task<Publisher::FetchResult> fetch(
+    Fetch fetch,
+    std::shared_ptr<FetchConsumer> consumer,
+    std::shared_ptr<Publisher> upstream);
+```
+
+<ParamField path="fetch" type="Fetch">
+  The fetch request specifying range to retrieve
+</ParamField>
+
+<ParamField path="consumer" type="std::shared_ptr<FetchConsumer>">
+  Consumer to receive cached and fetched objects
+</ParamField>
+
+<ParamField path="upstream" type="std::shared_ptr<Publisher>">
+  Upstream publisher to fetch missing objects from
+</ParamField>
+
+**Behavior**:
+1. Serves cached objects in the requested range immediately
+2. Identifies gaps (missing objects)
+3. Issues upstream FETCH for missing ranges
+4. Caches fetched objects for future requests
+5. Coalesces concurrent fetches for the same range
+
+## Configuration Methods
+
+### setMaxCacheDuration
+
+Sets a time-based expiry for a specific track.
+
+```cpp
+void setMaxCacheDuration(
+    const FullTrackName& ftn,
+    std::chrono::milliseconds duration);
+```
+
+<ParamField path="duration" type="std::chrono::milliseconds">
+  How long objects should be cached before expiring
+</ParamField>
+
+### setTrackExtensions
+
+Stores track-level extensions to include in FETCH_OK responses.
+
+```cpp
+void setTrackExtensions(const FullTrackName& ftn, Extensions extensions);
+```
+
+### setMaxCachedTracks / setMaxCachedGroupsPerTrack
+
+Dynamically update cache limits.
+
+```cpp
+void setMaxCachedTracks(size_t maxTracks);
+void setMaxCachedGroupsPerTrack(size_t maxGroups);
+```
+
+Evicts oldest entries if new limits are smaller than current size.
+
+## Cache Entry Structure
+
+### CacheEntry
+
+```cpp
+struct CacheEntry {
+  uint64_t subgroup;
+  ObjectStatus status;              // Normal, EndOfGroup, EndOfTrackAndGroup
+  Extensions extensions;
+  Payload payload;
+  bool complete;                    // Fully received (not partial)
+  bool forwardingPreferenceIsDatagram;
+  TimePoint cachedAt;              // For time-based expiry
+};
+```
+
+### CacheGroup
+
+```cpp
+struct CacheGroup {
+  folly::F14FastMap<uint64_t, std::unique_ptr<CacheEntry>> objects;
+  uint64_t maxCachedObject;
+  bool endOfGroup;
+  std::optional<uint64_t> seenPriorGroupIdGap;
+};
+```
+
+### CacheTrack
+
+```cpp
+struct CacheTrack {
+  folly::F14FastMap<uint64_t, std::shared_ptr<CacheGroup>> groups;
+  bool isLive;                      // Currently receiving data
+  bool endOfTrack;
+  std::optional<AbsoluteLocation> largestGroupAndObject;
+  FetchInProgressSet fetchInProgress; // Coalesces concurrent fetches
+  std::list<uint64_t> groupLRU;    // LRU list for groups
+  std::optional<std::chrono::milliseconds> maxCacheDuration;
+  Extensions extensions;            // Track-level extensions
+};
+```
+
+## LRU Eviction
+
+The cache uses a two-level LRU:
+
+1. **Track-level LRU**: Evicts entire tracks when `maxCachedTracks` is exceeded
+2. **Group-level LRU**: Evicts oldest groups per track when `maxCachedGroupsPerTrack` is exceeded
+
+**Evictability rules**:
+- Tracks are evictable when not live and have no active fetches
+- Groups are evictable when not part of an active fetch interval
+
+```cpp
+bool CacheTrack::canEvict() const {
+  return !isLive && activeFetchCount == 0;
+}
+```
+
+## Fetch Coalescing
+
+When multiple subscribers issue concurrent FETCHes for overlapping ranges:
+
+1. The cache maintains a `FetchInProgressSet` per track
+2. New fetches check for overlapping in-progress fetches
+3. If overlap exists, the new fetch waits for the in-progress fetch to complete
+4. Only one upstream FETCH is issued per unique range
+
+## Usage Example
+
+```cpp cache_integration.cpp
+#include <moxygen/relay/MoQCache.h>
+
+auto cache = std::make_unique<MoQCache>(
+  /* maxCachedTracks */ 50,
+  /* maxCachedGroupsPerTrack */ 5
+);
+
+// Configure time-based expiry
+cache->setMaxCacheDuration(
+  FullTrackName{"live-stream", "video"},
+  std::chrono::minutes(5)
+);
+
+// Wrap upstream subscription with caching
+auto cachedConsumer = cache->getSubscribeWriteback(ftn, consumer);
+co_await upstreamPublisher->subscribe(subReq, cachedConsumer);
+
+// Handle FETCH requests
+co_await cache->fetch(fetchReq, fetchConsumer, upstreamPublisher);
+
+// Query cache state
+if (cache->hasTrack(ftn)) {
+  if (cache->hasCachedObject(ftn, AbsoluteLocation{groupID, objectID})) {
+    // Object is cached
+  }
+}
+```
+
+## Integration with MoQRelay
+
+```cpp relay_with_cache.cpp
+auto relay = std::make_shared<MoQRelay>(
+  /* maxCachedTracks */ 100,
+  /* maxCachedGroupsPerTrack */ 3
+);
+
+// Relay creates MoQCache internally if maxCachedTracks > 0
+// Automatically uses getSubscribeWriteback() for upstream subscriptions
+// Automatically uses fetch() for FETCH requests
+```
+
+## Helper Methods
+
+### clear
+
+Clears all cached data.
+
+```cpp
+void clear();
+```
+
+### hasTrack
+
+Checks if a track is in the cache.
+
+```cpp
+bool hasTrack(const FullTrackName& ftn) const;
+```
+
+### size
+
+Returns the number of cached tracks.
+
+```cpp
+size_t size() const;
+```
+
+## Related Classes
+
+<CardGroup cols={3}>
+  <Card title="MoQRelay" href="/api/moq-relay">
+    Integrates MoQCache for relay caching
+  </Card>
+  <Card title="Publisher" href="/api/publisher">
+    fetch() interface implemented by cache
+  </Card>
+  <Card title="FetchConsumer" href="/api/fetch-consumer">
+    Consumer interface for FETCH
+  </Card>
+</CardGroup>

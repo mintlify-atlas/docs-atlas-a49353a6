@@ -1,0 +1,375 @@
+---
+title: Text Client Sample
+description: A MOQT subscriber client for connecting to text-based tracks
+---
+
+The Text Client is a versatile MOQT subscriber that connects to publishers and displays received text data. It's the perfect companion to the [Date Server](/samples/date-server) and a great tool for testing any MOQT publisher.
+
+## What It Does
+
+The Text Client:
+- Subscribes to or fetches text-based MOQT tracks
+- Displays object payloads and extensions
+- Supports multiple location types (latest, absolute range, etc.)
+- Can act as a publish receiver (passive publisher mode)
+- Demonstrates joining fetches for seamless historical + live data
+- Logs all received objects to stdout
+
+## Source Code
+
+The sample is located at:
+```
+moxygen/samples/text-client/MoQTextClient.cpp
+```
+
+## Building the Sample
+
+The Text Client is built automatically with Moxygen:
+
+```bash
+./build/fbcode_builder/getdeps.py build moxygen
+```
+
+The binary will be at:
+```bash
+$MOXYGEN_BUILD_PATH/moxygen/samples/text-client/moqtextclient
+```
+
+## Basic Usage
+
+### Connecting to the Date Server
+
+Subscribe to the latest data from the date server:
+
+```bash
+$MOXYGEN_BUILD_PATH/moxygen/samples/text-client/moqtextclient \
+  --insecure \
+  --connect_url "https://localhost:4433/moq-date" \
+  --track_namespace "moq-date" \
+  --track_name "date"
+```
+
+### Subscribing from a Specific Point
+
+Start from group 100, object 0:
+
+```bash
+$MOXYGEN_BUILD_PATH/moxygen/samples/text-client/moqtextclient \
+  --insecure \
+  --connect_url "https://localhost:4433/moq-date" \
+  --track_namespace "moq-date" \
+  --track_name "date" \
+  --sg 100 \
+  --so 0
+```
+
+### Subscribing to a Range
+
+Subscribe from group 100 to group 105:
+
+```bash
+$MOXYGEN_BUILD_PATH/moxygen/samples/text-client/moqtextclient \
+  --insecure \
+  --connect_url "https://localhost:4433/moq-date" \
+  --track_namespace "moq-date" \
+  --track_name "date" \
+  --sg 100 \
+  --eg 105
+```
+
+## Command-Line Options
+
+### Connection Options
+
+| Flag | Description | Default |
+|------|-------------|----------|
+| `--connect_url` | URL of the MOQT server | Required |
+| `--insecure` | Skip certificate validation | `false` |
+| `--connect_timeout` | Connection timeout in ms | `1000` |
+| `--transaction_timeout` | Transaction timeout in seconds | `120` |
+| `--quic_transport` | Use raw QUIC instead of WebTransport | `false` |
+| `--versions` | Comma-separated MoQ draft versions | All supported |
+
+### Subscription Options
+
+| Flag | Description | Default |
+|------|-------------|----------|
+| `--track_namespace` | Track namespace to subscribe to | Required |
+| `--track_namespace_delimiter` | Namespace delimiter | `/` |
+| `--track_name` | Track name to subscribe to | Required |
+| `--sg` | Start group number | Latest |
+| `--so` | Start object number | `0` (when `--sg` set) |
+| `--eg` | End group number (creates range) | - |
+| `--forward` | Subscribe in forward direction | `true` |
+| `--fetch` | Use FETCH instead of SUBSCRIBE | `false` |
+| `--jrfetch` | Joining relative fetch | `false` |
+| `--jafetch` | Joining absolute fetch | `false` |
+| `--join_start` | Joining fetch start point | `0` |
+
+### Publishing Options
+
+| Flag | Description | Default |
+|------|-------------|----------|
+| `--publish` | Act as publish receiver | `false` |
+| `--unsubscribe` | Unsubscribe after specified time | `false` |
+| `--unsubscribe_time` | Time before unsubscribing (seconds) | `30` |
+
+### Advanced Options
+
+| Flag | Description | Default |
+|------|-------------|----------|
+| `--delivery_timeout` | Delivery timeout in milliseconds | `0` |
+| `--mlog_path` | Path to write MoQ logs | - |
+
+## Subscription Modes
+
+<Tabs>
+  <Tab title="Latest Data">
+    Subscribe to the latest available data (default behavior):
+
+    ```bash
+    moqtextclient --connect_url "https://localhost:4433/moq" \
+                  --track_namespace "example" \
+                  --track_name "track1"
+    ```
+
+    The client will start receiving from the largest available object.
+  </Tab>
+  <Tab title="Absolute Start">
+    Start from a specific group/object:
+
+    ```bash
+    moqtextclient --connect_url "https://localhost:4433/moq" \
+                  --track_namespace "example" \
+                  --track_name "track1" \
+                  --sg 50 --so 10
+    ```
+
+    Continues indefinitely from the specified location.
+  </Tab>
+  <Tab title="Absolute Range">
+    Subscribe to a specific range of groups:
+
+    ```bash
+    moqtextclient --connect_url "https://localhost:4433/moq" \
+                  --track_namespace "example" \
+                  --track_name "track1" \
+                  --sg 50 --eg 100
+    ```
+
+    Ends after receiving all objects through group 100.
+  </Tab>
+  <Tab title="Fetch">
+    Use FETCH for historical data:
+
+    ```bash
+    moqtextclient --connect_url "https://localhost:4433/moq" \
+                  --track_namespace "example" \
+                  --track_name "track1" \
+                  --fetch --sg 0 --eg 50
+    ```
+
+    Retrieves past data without a live subscription.
+  </Tab>
+</Tabs>
+
+## Example Output
+
+When connected to the date server:
+
+```
+I1007 12:05:46.516857 3558180 MoQTextClient.cpp:191] run
+I1007 12:05:46.579533 3558180 MoQTextClient.cpp:250] Largest={29331065, 47}
+47
+48
+49
+50
+int extension=1977
+data extension=AQIDBAU=
+2025-10-07 12:06:
+0
+1
+2
+3
+ObjectStatus=3
+```
+
+**Explanation:**
+- `Largest={29331065, 47}` - The current group/object when connecting
+- Numbers `47`, `48`, `49`... - Object payloads (seconds)
+- `int extension` and `data extension` - Object extensions
+- `2025-10-07 12:06:` - Minute timestamp
+- `ObjectStatus=3` - End of group marker
+
+## Code Walkthrough
+
+### MoQTextClient Class
+
+The main client class implements both `Subscriber` and handles session management:
+
+```cpp
+class MoQTextClient : public Subscriber,
+                      public std::enable_shared_from_this<MoQTextClient> {
+  MoQRelayClient moqClient_;
+  std::shared_ptr<ObjectReceiver> subTextReceiver_;
+  std::shared_ptr<ObjectReceiver> fetchTextReceiver_;
+  std::shared_ptr<Publisher::SubscriptionHandle> subscription_;
+};
+```
+
+See: `MoQTextClient.cpp:159-405`
+
+### TextHandler Class
+
+The `TextHandler` receives and processes objects:
+
+```cpp
+class TextHandler : public ObjectReceiverCallback {
+  FlowControlState onObject(
+      std::optional<TrackAlias> trackAlias,
+      const ObjectHeader& header,
+      Payload payload) override {
+    // Display extensions
+    for (const auto& ext : header.extensions.getMutableExtensions()) {
+      // ... print extension
+    }
+    // Display payload
+    if (payload) {
+      std::cout << payload->moveToFbString() << std::endl;
+    }
+    return FlowControlState::UNBLOCKED;
+  }
+};
+```
+
+See: `MoQTextClient.cpp:104-157`
+
+### Subscription Flow
+
+1. **Setup** - Establish connection and negotiate MOQT version
+2. **Subscribe/Fetch** - Send subscription or fetch request
+3. **Receive** - Process incoming objects via `TextHandler`
+4. **Catchup** - Optionally fetch historical data before live subscription
+5. **Drain** - Close session gracefully
+
+See: `MoQTextClient.cpp:225-357`
+
+## Advanced Features
+
+### Joining Fetch
+
+Seamlessly combine historical and live data:
+
+```bash
+moqtextclient --connect_url "https://localhost:4433/moq" \
+              --track_namespace "moq-date" \
+              --track_name "date" \
+              --jafetch --join_start 100
+```
+
+This performs a FETCH from the join point to latest, then automatically transitions to SUBSCRIBE for live data.
+
+### Publish Mode
+
+Act as a passive publisher (receive PUBLISH requests from relay):
+
+```bash
+moqtextclient --connect_url "https://localhost:4433/moq" \
+              --track_namespace "example" \
+              --track_name "" \
+              --publish
+```
+
+The client will:
+1. Call `subscribeNamespace()` to advertise interest
+2. Accept incoming `PUBLISH` requests from the relay
+3. Display all published objects
+
+### Automatic Catchup
+
+If you subscribe to an absolute start point before the "largest" object, the client automatically:
+1. Issues a FETCH for the historical range
+2. Maintains the SUBSCRIBE for live data
+3. Seamlessly transitions between the two
+
+See: `MoQTextClient.cpp:283-321`
+
+## Key Concepts Demonstrated
+
+<AccordionGroup>
+  <Accordion title="Subscriber Implementation">
+    Shows how to implement the `Subscriber` interface:
+    - Publishing namespace (for publish mode)
+    - Handling publish requests
+    - Processing goaway messages
+  </Accordion>
+
+  <Accordion title="ObjectReceiver">
+    Uses `ObjectReceiver` to handle incoming objects with flow control:
+    ```cpp
+    auto receiver = std::make_shared<ObjectReceiver>(
+        ObjectReceiver::SUBSCRIBE, handler);
+    auto result = co_await session->subscribe(req, receiver);
+    ```
+  </Accordion>
+
+  <Accordion title="Location Types">
+    Demonstrates all location types:
+    - `LargestObject` - Start from latest
+    - `AbsoluteStart` - Start from specific location
+    - `AbsoluteRange` - Subscribe to specific range
+  </Accordion>
+
+  <Accordion title="FETCH vs SUBSCRIBE">
+    Shows the difference between:
+    - **FETCH** - One-time historical data retrieval
+    - **SUBSCRIBE** - Ongoing live data stream
+    - **Joining Fetch** - Combined historical + live
+  </Accordion>
+
+  <Accordion title="Object Extensions">
+    Demonstrates receiving and decoding both integer and binary extensions attached to objects.
+  </Accordion>
+</AccordionGroup>
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="SubscribeError: TRACK_NOT_EXIST">
+    The track namespace or name doesn't match the publisher:
+    ```bash
+    # Check that these match the publisher's configuration
+    --track_namespace "moq-date" \
+    --track_name "date"
+    ```
+  </Accordion>
+
+  <Accordion title="SubscribeError: INVALID_RANGE">
+    Your requested range is entirely in the past. Use `--fetch` instead:
+    ```bash
+    moqtextclient --fetch --sg 0 --eg 10 ...
+    ```
+  </Accordion>
+
+  <Accordion title="No objects received">
+    Check the `Largest=` output. If your start point is after largest, you won't receive historical data until new objects arrive.
+  </Accordion>
+
+  <Accordion title="Connection timeout">
+    Increase the timeout or check network connectivity:
+    ```bash
+    --connect_timeout 5000  # 5 seconds
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Date Server" icon="clock" href="/samples/date-server">
+    Publisher to test the text client with
+  </Card>
+  <Card title="Chat Client" icon="comments" href="/samples/chat-client">
+    Bidirectional communication example
+  </Card>
+</CardGroup>

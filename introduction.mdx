@@ -1,0 +1,153 @@
+---
+title: Introduction to Moxygen
+description: A general-purpose C++ library for implementing MOQT (Media over QUIC Transport) applications
+---
+
+## What is Moxygen?
+
+**Moxygen** is a general-purpose C++ library for implementing [MOQT (Media over QUIC Transport)](https://datatracker.ietf.org/doc/draft-ietf-moq-transport/) applications. It provides a complete implementation of the MOQT protocol with flexible, composable APIs for building publishers, subscribers, relays, and custom media delivery applications.
+
+MOQT is an emerging protocol that enables ultra-low latency media streaming by leveraging QUIC's multiplexing, reliability, and flow control features. Unlike traditional streaming protocols, MOQT is designed for both live streaming and real-time communication scenarios.
+
+## Key Features
+
+<CardGroup cols={2}>
+  <Card title="Symmetric APIs" icon="arrow-right-arrow-left">
+    Publisher and Subscriber interfaces are symmetric, enabling components to be easily chained together for filtering, proxying, and relay scenarios.
+  </Card>
+  
+  <Card title="Transport Agnostic" icon="plug">
+    Core protocol logic is decoupled from transport via the `proxygen::WebTransport` interface, supporting HTTP/3 WebTransport, native QUIC, and alternative implementations.
+  </Card>
+  
+  <Card title="Composable Architecture" icon="cubes">
+    Build complex media delivery pipelines by chaining publishers, subscribers, filters, relays, and caches together.
+  </Card>
+  
+  <Card title="Coroutine-Based" icon="code">
+    Uses folly coroutines for clean, asynchronous operations without callback hell.
+  </Card>
+</CardGroup>
+
+## When to Use Moxygen
+
+Moxygen is ideal for applications that require:
+
+- **Ultra-low latency live streaming** - Video conferencing, live sports, interactive broadcasts
+- **Real-time data distribution** - Live sensor data, financial market data, telemetry
+- **Scalable CDN infrastructure** - Building relay networks and edge caches for media delivery
+- **Custom media protocols** - Implementing specialized transport logic on top of MOQT
+
+<Note>
+Moxygen is experimental software. The MOQT protocol is still under development as an IETF draft.
+</Note>
+
+## Architecture Overview
+
+Moxygen is designed around two key principles:
+
+### 1. Symmetric APIs
+
+Publisher and Subscriber interfaces are symmetric, which means:
+
+- **Publishers implement `subscribe()`** to handle incoming subscription requests
+- **Subscribers implement `publishNamespace()`** to advertise track availability
+- This symmetry enables **chaining**: output from one component feeds into the next
+
+```cpp
+// Subscribers call subscribe on publishers
+auto result = publisher->subscribe(subReq, consumer);
+
+// Publishers call publishNamespace on subscribers  
+auto handle = subscriber->publishNamespace(nsReq);
+```
+
+### 2. Transport Agnostic Design
+
+The core `MoQSession` operates over any `proxygen::WebTransport` implementation:
+
+- **HTTP/3 WebTransport** - Standard browser-compatible transport
+- **Native QUIC** - Direct QUIC transport without HTTP overhead
+- **Custom implementations** - Bring your own transport layer
+
+### Component Composition
+
+Components can be chained to build powerful delivery pipelines:
+
+```
+Publisher → Filter → Relay → Cache → Subscriber
+```
+
+Each component:
+1. Implements the consumer interface to receive data from upstream
+2. Implements the publisher interface to serve data to downstream
+3. Can modify, filter, or cache data in between
+
+## Core Components
+
+### MoQSession
+
+The primary class that implements the MOQT protocol. It inherits from both `Publisher` and `Subscriber`, making it the key component for MOQT communication.
+
+**Key capabilities:**
+- Bidirectional communication (publish and subscribe)
+- Protocol version negotiation
+- Flow control and backpressure
+- Statistics and monitoring hooks
+
+### MoQServer & MoQClient
+
+High-level APIs for building MOQT applications:
+
+- **MoQServer** - Accepts HTTP/3 WebTransport connections and creates sessions
+- **MoQClient** - Connects to MOQT servers via HTTP/3 or native QUIC
+
+### MoQRelay & MoQForwarder
+
+- **MoQRelay** - Routes subscriptions and publishes between sessions, maintains namespace mappings
+- **MoQForwarder** - Reusable component for fan-out data forwarding to multiple subscribers
+
+## Use Cases
+
+### Live Streaming Platform
+
+Combine Moxygen with [moq-encoder-player](https://github.com/facebookexperimental/moq-encoder-player) to create a complete live streaming platform:
+
+```
+Encoder → Moxygen Relay → CDN Edge → Player
+```
+
+### Real-Time Data Distribution
+
+Use the date server sample as a starting point for distributing real-time data:
+
+- Time series data from sensors
+- Financial market updates
+- Live telemetry and metrics
+
+### Custom Media Applications
+
+Build specialized applications by implementing the Publisher and Subscriber interfaces:
+
+- Content filtering and moderation
+- Real-time transcoding and adaptation
+- Multi-tenant relay infrastructure
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Installation" icon="download" href="/installation">
+    Build Moxygen and its dependencies on your system
+  </Card>
+  
+  <Card title="Quick Start" icon="rocket" href="/quickstart">
+    Get a working date server and client running in minutes
+  </Card>
+</CardGroup>
+
+## Additional Resources
+
+- [MOQT Protocol Specification](https://datatracker.ietf.org/doc/draft-ietf-moq-transport/)
+- [Moxygen GitHub Repository](https://github.com/facebookexperimental/moxygen)
+- [Architecture Deep Dive](/architecture) (see ARCHITECTURE.md in source)
+- [Sample Applications](/samples)

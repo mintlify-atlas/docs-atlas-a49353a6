@@ -1,0 +1,491 @@
+---
+title: Flow Control & Backpressure
+description: Managing buffering, backpressure, and rate limiting in Moxygen applications
+---
+
+## Overview
+
+Moxygen provides multiple layers of flow control to prevent overwhelming subscribers and manage network congestion:
+
+1. **Transport-Level Flow Control**: QUIC stream and connection flow control (automatic)
+2. **Buffering Thresholds**: Per-subscription and per-session limits
+3. **Application Backpressure**: Explicit backpressure APIs for publishers and subscribers
+
+Proper flow control is essential for:
+- **Preventing TOO_FAR_BEHIND errors**: Slow consumers can't keep up
+- **Avoiding memory exhaustion**: Unbounded buffering consumes resources
+- **Maintaining QoS**: Prioritize important data, drop stale data
+
+## Transport-Level Flow Control
+
+### QUIC Stream Flow Control
+
+QUIC provides automatic flow control at the stream and connection level:
+
+- **Stream credit**: Receiver grants credit for how much data sender can transmit
+- **Connection credit**: Total bytes across all streams
+- **Automatic updates**: Receiver sends credit updates as data is consumed
+
+Moxygen applications don't need to manage QUIC flow control directly—it happens automatically in the transport layer.
+
+<Info>
+Transport flow control prevents network congestion but doesn't account for application processing time. Slow applications still need application-level backpressure.
+</Info>
+
+## Buffering Thresholds
+
+### MoQSettings Configuration
+
+Defined in `moxygen/MoQSession.h`:
+
+```cpp
+struct BufferingThresholds {
+  // Maximum bytes buffered per subscription (0 = no limit)
+  uint64_t perSubscription{0};
+  
+  // Maximum bytes buffered per session (0 = no limit)
+  uint64_t perSession{0};
+};
+
+struct MoQSettings {
+  BufferingThresholds bufferingThresholds{};
+  
+  // Timeouts for various operations
+  std::chrono::milliseconds setupTimeout{std::chrono::seconds(5)};
+  std::chrono::milliseconds versionNegotiationTimeout{std::chrono::seconds(2)};
+  std::chrono::milliseconds unknownAliasTimeout{std::chrono::seconds(2)};
+  std::chrono::milliseconds publishDoneStreamCountTimeout{std::chrono::seconds(2)};
+};
+```
+
+### Configuring Buffering Limits
+
+```cpp
+// Create session
+auto session = std::make_shared<MoQSession>(wt, executor);
+
+// Set buffering thresholds
+MoQSettings settings;
+settings.bufferingThresholds.perSubscription = 10 * 1024 * 1024; // 10 MB
+settings.bufferingThresholds.perSession = 50 * 1024 * 1024;      // 50 MB
+
+session->setMoqSettings(settings);
+```
+
+### TOO_FAR_BEHIND Termination
+
+When a subscription exceeds its buffering threshold:
+
+1. Session terminates the subscription with `TOO_FAR_BEHIND` error
+2. Subscriber receives `publishDone()` with status code `TOO_FAR_BEHIND`
+3. Subscription is closed, no further data is delivered
+
+**From `MoQSession.cpp`:**
+
+```cpp
+if (!publisherImpl->canBufferBytes(payloadSize)) {
+  // Exceeded buffering threshold - terminate subscription
+  publisherImpl->terminatePublish(
+      PublishDone{
+          PublishDoneStatusCode::TOO_FAR_BEHIND,
+          "Subscriber exceeded buffer limit"
+      },
+      ResetStreamErrorCode::TOO_FAR_BEHIND
+  );
+  return MoQPublishError(
+      MoQPublishError::TOO_FAR_BEHIND,
+      "Too far behind"
+  );
+}
+```
+
+### Choosing Appropriate Thresholds
+
+**High-bandwidth live streaming:**
+```cpp
+settings.bufferingThresholds.perSubscription = 50 * 1024 * 1024; // 50 MB
+// Allow ~10 seconds of 40 Mbps video
+```
+
+**Low-latency gaming:**
+```cpp
+settings.bufferingThresholds.perSubscription = 1 * 1024 * 1024; // 1 MB
+// Tight limit, drop slow clients quickly
+```
+
+**Historical fetch with backpressure:**
+```cpp
+settings.bufferingThresholds.perSubscription = 0; // No limit
+// Use application backpressure instead (awaitReadyToConsume)
+```
+
+## Application Backpressure
+
+### awaitReadyToConsume (FETCH)
+
+`FetchConsumer` provides explicit backpressure control:
+
+```cpp
+class FetchConsumer {
+ public:
+  // Wait for the fetch to become writable
+  // Returns: number of bytes that can be written
+  // Error: MoQPublishError::BLOCKED if consumer can't accept data
+  virtual folly::Expected<folly::SemiFuture<uint64_t>, MoQPublishError>
+  awaitReadyToConsume() = 0;
+};
+```
+
+**Publisher using backpressure:**
+
+```cpp
+folly::coro::Task<void> publishHistoricalData(
+    std::shared_ptr<FetchConsumer> fetchConsumer,
+    std::vector<Object> objects) {
+  
+  auto subgroup = co_await fetchConsumer->beginObject(
+      groupId, subgroupId, objectId, length, initialPayload
+  );
+  
+  for (const auto& chunk : objectChunks) {
+    // Wait for consumer to be ready
+    auto readyResult = co_await fetchConsumer->awaitReadyToConsume();
+    if (readyResult.hasError()) {
+      // Consumer returned BLOCKED - stop publishing
+      XLOG(WARN) << "Fetch consumer blocked, stopping";
+      co_return;
+    }
+    
+    uint64_t availableBytes = readyResult.value().value();
+    if (availableBytes < chunk.size()) {
+      // Wait for more credit
+      co_await folly::futures::sleep(std::chrono::milliseconds(100));
+      continue;
+    }
+    
+    // Send chunk
+    auto result = subgroup->objectPayload(chunk);
+    if (result.hasError()) {
+      XLOG(ERR) << "Failed to send chunk: " << result.error().errorCode;
+      co_return;
+    }
+  }
+  
+  co_await subgroup->endOfSubgroup();
+}
+```
+
+**Subscriber implementing backpressure:**
+
+```cpp
+class MyFetchConsumer : public FetchConsumer {
+ private:
+  std::atomic<uint64_t> pendingBytes_{0};
+  folly::coro::SharedPromise<uint64_t> readyPromise_;
+  
+ public:
+  folly::Expected<folly::SemiFuture<uint64_t>, MoQPublishError>
+  awaitReadyToConsume() override {
+    if (pendingBytes_ > 10 * 1024 * 1024) {
+      // Too much data pending, signal BLOCKED
+      return folly::makeUnexpected(
+          MoQPublishError(MoQPublishError::BLOCKED, "Consumer overloaded")
+      );
+    }
+    
+    // Return available buffer space
+    return readyPromise_.getSemiFuture();
+  }
+  
+  void onDataProcessed(uint64_t bytes) {
+    pendingBytes_ -= bytes;
+    // Signal publisher that more space is available
+    readyPromise_.setValue(10 * 1024 * 1024 - pendingBytes_);
+  }
+};
+```
+
+<Info>
+`awaitReadyToConsume()` is **only for FETCH**, not subscriptions. Subscriptions use buffering thresholds and TOO_FAR_BEHIND termination instead.
+</Info>
+
+### awaitStreamCredit (SUBSCRIBE)
+
+`TrackConsumer` provides a way to wait for stream credit:
+
+```cpp
+class TrackConsumer {
+ public:
+  // Wait for additional stream credit
+  virtual folly::Expected<folly::SemiFuture<folly::Unit>, MoQPublishError>
+  awaitStreamCredit() = 0;
+};
+```
+
+**Publisher pausing when out of stream credit:**
+
+```cpp
+folly::coro::Task<void> publishWithFlowControl(
+    std::shared_ptr<TrackConsumer> consumer,
+    std::vector<Group> groups) {
+  
+  for (const auto& group : groups) {
+    auto subgroup = co_await consumer->beginSubgroup(
+        group.id, 0, priority
+    );
+    
+    if (subgroup.hasError() &&
+        subgroup.error().errorCode == MoQPublishError::BLOCKED) {
+      // Out of stream credit - wait
+      XLOG(INFO) << "Waiting for stream credit...";
+      auto creditResult = co_await consumer->awaitStreamCredit();
+      if (creditResult.hasError()) {
+        XLOG(ERR) << "Failed to get stream credit";
+        co_return;
+      }
+      
+      // Retry beginSubgroup
+      subgroup = co_await consumer->beginSubgroup(group.id, 0, priority);
+    }
+    
+    if (subgroup.hasError()) {
+      XLOG(ERR) << "Failed to begin subgroup: " << subgroup.error().errorCode;
+      co_return;
+    }
+    
+    // Publish objects
+    for (const auto& obj : group.objects) {
+      subgroup.value()->object(obj.id, obj.payload);
+    }
+  }
+}
+```
+
+### Handling MoQPublishError::BLOCKED
+
+Any consumer method can return `MoQPublishError::BLOCKED`:
+
+```cpp
+auto result = consumer->beginSubgroup(groupId, subgroupId, priority);
+if (result.hasError()) {
+  switch (result.error().errorCode) {
+    case MoQPublishError::BLOCKED:
+      // Temporary condition - can retry
+      XLOG(INFO) << "Consumer blocked, retrying later";
+      co_await folly::futures::sleep(std::chrono::milliseconds(100));
+      break;
+      
+    case MoQPublishError::TOO_FAR_BEHIND:
+      // Permanent error - subscription terminated
+      XLOG(ERR) << "Subscriber too far behind, closing";
+      co_return;
+      
+    case MoQPublishError::CANCELLED:
+      // Subscriber cancelled subscription
+      XLOG(INFO) << "Subscription cancelled";
+      co_return;
+      
+    default:
+      XLOG(ERR) << "Publish error: " << result.error().errorCode;
+      co_return;
+  }
+}
+```
+
+## Best Practices
+
+### 1. Set Appropriate Buffering Thresholds
+
+**Live streaming:**
+- Set `perSubscription` to 2-5 seconds of video bitrate
+- Example: 10 Mbps stream → 2.5 MB threshold
+
+**Interactive applications:**
+- Use tight limits to drop slow clients quickly
+- Example: 1 MB threshold for gaming
+
+**Historical fetch:**
+- Disable thresholds (`perSubscription = 0`)
+- Use `awaitReadyToConsume()` for explicit backpressure
+
+### 2. Monitor TOO_FAR_BEHIND Errors
+
+Track how often subscribers are terminated:
+
+```cpp
+class MyPublisherStats : public MoQPublisherStatsCallback {
+  void onSubscriptionTerminated(
+      const FullTrackName& ftn,
+      PublishDoneStatusCode code) override {
+    if (code == PublishDoneStatusCode::TOO_FAR_BEHIND) {
+      tooFarBehindCounter_++;
+      XLOG(WARN) << "Subscriber too far behind: " << ftn;
+    }
+  }
+};
+```
+
+High `TOO_FAR_BEHIND` rates indicate:
+- Thresholds too tight for network conditions
+- Subscribers underpowered for content bitrate
+- Network congestion
+
+### 3. Use Priority for QoS
+
+Prioritize important data:
+
+```cpp
+// High priority for I-frames
+auto iframe = consumer->beginSubgroup(
+    groupId, /*subgroupId=*/0, /*priority=*/0
+).value();
+
+// Lower priority for P-frames
+auto pframe = consumer->beginSubgroup(
+    groupId, /*subgroupId=*/1, /*priority=*/128
+).value();
+
+// Lowest priority for B-frames
+auto bframe = consumer->beginSubgroup(
+    groupId, /*subgroupId=*/2, /*priority=*/255
+).value();
+```
+
+Lower priority data is dropped first when congested.
+
+### 4. Implement Rate Limiting
+
+Publishers can rate-limit to match subscriber capacity:
+
+```cpp
+class RateLimitedPublisher {
+ private:
+  folly::TokenBucket rateLimiter_{10 * 1024 * 1024}; // 10 MB/s
+  
+ public:
+  folly::coro::Task<void> publishWithRateLimit(
+      std::shared_ptr<TrackConsumer> consumer,
+      Payload payload) {
+    
+    // Wait for tokens
+    while (!rateLimiter_.consume(payload.size())) {
+      co_await folly::futures::sleep(std::chrono::milliseconds(10));
+    }
+    
+    // Publish object
+    co_await consumer->objectStream(header, payload);
+  }
+};
+```
+
+### 5. Handle Slow Subscribers in Relays
+
+Relays should isolate slow subscribers:
+
+```cpp
+// In MoQForwarder, slow subscribers are removed automatically
+void MoQForwarder::handleSubgroupError(
+    Subscriber& sub,
+    const SubgroupIdentifier& subgroupId,
+    const MoQPublishError& err) {
+  
+  if (err.errorCode == MoQPublishError::TOO_FAR_BEHIND) {
+    XLOG(WARN) << "Removing slow subscriber: " << sub.session;
+    removeSubscriber(sub.session, PublishDone{...});
+  }
+}
+```
+
+This prevents slow subscribers from impacting others.
+
+### 6. Use Delivery Timeouts
+
+Set delivery timeouts to drop stale data:
+
+```cpp
+std::vector<Parameter> params;
+params.push_back(Parameter{
+    ParameterKey::DELIVERY_TIMEOUT,
+    folly::to<uint64_t>(5000)  // 5 seconds
+});
+
+subReq.parameters = std::move(params);
+```
+
+Objects not delivered within timeout are dropped with `CANCELLED` error.
+
+### 7. Checkpoint Strategically
+
+Use `checkpoint()` to mark reliable delivery boundaries:
+
+```cpp
+auto subgroup = consumer->beginSubgroup(groupId, subgroupId, priority).value();
+
+// Send I-frame (important)
+subgroup->object(0, iframePayload);
+subgroup->checkpoint(); // Mark reliable boundary
+
+// Send P-frames (less important)
+subgroup->object(1, pframe1);
+subgroup->object(2, pframe2);
+// No checkpoint - can reset without loss
+
+if (errorCondition) {
+  // Reset stream - I-frame delivered reliably, P-frames may be lost
+  subgroup->reset(ResetStreamErrorCode::INTERNAL_ERROR);
+}
+```
+
+## Debugging Flow Control Issues
+
+### Enable MLogger
+
+```cpp
+auto logger = std::make_shared<MLogger>();
+session->setLogger(logger);
+
+// After session closes, analyze logs
+for (const auto& event : logger->getEvents()) {
+  if (event.type == MLogEventType::TOO_FAR_BEHIND) {
+    XLOG(INFO) << "TOO_FAR_BEHIND at group " << event.groupId;
+  }
+}
+```
+
+### Monitor Buffering Stats
+
+```cpp
+class MySubscriberStats : public MoQSubscriberStatsCallback {
+  void onObjectReceived(
+      const FullTrackName& ftn,
+      uint64_t groupId,
+      uint64_t objectId,
+      uint64_t payloadSize) override {
+    
+    totalBytesReceived_ += payloadSize;
+    totalObjectsReceived_++;
+    
+    if (totalObjectsReceived_ % 100 == 0) {
+      XLOG(INFO) << "Received " << totalObjectsReceived_ << " objects, "
+                 << totalBytesReceived_ << " bytes";
+    }
+  }
+};
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Architecture" icon="sitemap" href="/concepts/architecture">
+    Learn about threading and executors
+  </Card>
+  <Card title="Relay & Forwarding" icon="server" href="/concepts/relay-forwarding">
+    Handle flow control in relay scenarios
+  </Card>
+  <Card title="Performance Tuning" icon="gauge" href="/guides/performance">
+    Optimize for high throughput
+  </Card>
+  <Card title="API Reference" icon="book" href="/api-reference/classes/moqsession">
+    Full MoQSettings documentation
+  </Card>
+</CardGroup>

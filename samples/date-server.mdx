@@ -1,0 +1,307 @@
+---
+title: Date Server Sample
+description: A simple MOQT publisher that broadcasts the current date and time
+---
+
+The Date Server is the simplest sample application in Moxygen. It demonstrates the fundamentals of MOQT publishing by broadcasting the current date and time every second to any connected subscribers.
+
+## What It Does
+
+The Date Server:
+- Publishes to the `moq-date/date` track
+- Sends the current minute as the first object in each group
+- Sends individual seconds (0-59) as subsequent objects
+- Demonstrates three transmission modes: stream-per-group, stream-per-object, and datagram
+- Supports extensions on published objects
+- Can optionally relay through an upstream MOQT relay
+
+## Source Code
+
+The sample is located at:
+```
+moxygen/samples/date/MoQDateServer.cpp
+```
+
+## Building the Sample
+
+The Date Server is built automatically when you build Moxygen:
+
+```bash
+./build/fbcode_builder/getdeps.py build moxygen
+```
+
+The binary will be at:
+```bash
+$MOXYGEN_BUILD_PATH/moxygen/samples/date/moqdateserver
+```
+
+## Running the Server
+
+### Basic Usage
+
+Start the date server with default settings:
+
+```bash
+$MOXYGEN_BUILD_PATH/moxygen/samples/date/moqdateserver \
+  -port 4433 \
+  -cert ./certs/certificate.pem \
+  -key ./certs/certificate.key \
+  --logging DBG1
+```
+
+### Command-Line Options
+
+| Flag | Description | Default |
+|------|-------------|----------|
+| `-port` | Server port number | `9667` |
+| `-cert` | Path to TLS certificate | Required |
+| `-key` | Path to TLS private key | Required |
+| `-mode` | Transmission mode: `spg`, `spo`, or `datagram` | `spg` |
+| `-ns` | Namespace for the date track | `moq-date` |
+| `--relay_url` | Upstream relay URL (optional) | - |
+| `--publish` | Send PUBLISH to relay subscribers | `false` |
+| `--insecure` | Skip certificate validation | `false` |
+| `--logging` | Log level (DBG1, DBG4, INFO, ERR) | INFO |
+| `--delivery_timeout` | Delivery timeout in ms | `0` |
+| `--versions` | MoQ draft versions (comma-separated) | All supported |
+
+### Transmission Modes
+
+<Tabs>
+  <Tab title="Stream-Per-Group (spg)">
+    **Stream-Per-Group** mode uses one stream for all objects in a group (one minute of data).
+
+    ```bash
+    $MOXYGEN_BUILD_PATH/moxygen/samples/date/moqdateserver \
+      -mode spg -port 4433 \
+      -cert ./certs/certificate.pem -key ./certs/certificate.key
+    ```
+
+    This is the **default and recommended mode** for most use cases.
+  </Tab>
+  <Tab title="Stream-Per-Object (spo)">
+    **Stream-Per-Object** mode creates a separate stream for each object (each second).
+
+    ```bash
+    $MOXYGEN_BUILD_PATH/moxygen/samples/date/moqdateserver \
+      -mode spo -port 4433 \
+      -cert ./certs/certificate.pem -key ./certs/certificate.key
+    ```
+
+    Useful for demonstrating high stream overhead.
+  </Tab>
+  <Tab title="Datagram">
+    **Datagram** mode sends each object as a single datagram.
+
+    ```bash
+    $MOXYGEN_BUILD_PATH/moxygen/samples/date/moqdateserver \
+      -mode datagram -port 4433 \
+      -cert ./certs/certificate.pem -key ./certs/certificate.key
+    ```
+
+    Best for low-latency, unreliable delivery scenarios.
+  </Tab>
+</Tabs>
+
+## Connecting with Text Client
+
+Once the server is running, connect using the [Text Client](/samples/text-client):
+
+```bash
+$MOXYGEN_BUILD_PATH/moxygen/samples/text-client/moqtextclient \
+  --insecure \
+  --connect_url "https://localhost:4433/moq-date" \
+  --track_namespace "moq-date" \
+  --track_name "date"
+```
+
+### Expected Output
+
+The text client should display output similar to:
+
+```
+I1007 12:05:46.516857 3558180 MoQTextClient.cpp:191] run
+I1007 12:05:46.579533 3558180 MoQTextClient.cpp:250] Largest={29331065, 47}
+47
+48
+49
+50
+51
+52
+53
+54
+55
+56
+57
+58
+59
+ObjectStatus=3
+int extension=1977
+data extension=AQIDBAU=
+2025-10-07 12:06:
+0
+1
+2
+```
+
+Each number represents a second within the current minute.
+
+## Code Walkthrough
+
+### DatePublisher Class
+
+The `DatePublisher` class implements the `Publisher` interface:
+
+```cpp
+class DatePublisher : public Publisher {
+  folly::coro::Task<SubscribeResult> subscribe(
+      SubscribeRequest subReq,
+      std::shared_ptr<TrackConsumer> consumer) override;
+
+  folly::coro::Task<FetchResult> fetch(
+      Fetch fetch,
+      std::shared_ptr<FetchConsumer> consumer) override;
+
+  folly::coro::Task<TrackStatusResult> trackStatus(
+      TrackStatus trackStatus) override;
+};
+```
+
+Key components:
+- **subscribe()** - Handles new subscriber requests
+- **fetch()** - Serves historical data on demand
+- **trackStatus()** - Reports track availability and largest object
+
+See: `MoQDateServer.cpp:80-529`
+
+### Publishing Loop
+
+The main publishing loop runs every second:
+
+```cpp
+folly::coro::Task<void> publishDateLoop() {
+  while (!cancelToken.isCancellationRequested()) {
+    auto [minute, second] = now();
+    publishDate(subgroupPublisher, minute, second);
+    co_await folly::coro::sleep(std::chrono::seconds(1));
+  }
+}
+```
+
+See: `MoQDateServer.cpp:410-445`
+
+### Object Structure
+
+Each minute is represented as a **group**, with 62 **objects**:
+- Object 0: The minute timestamp (e.g., "2025-10-07 12:06:")
+- Objects 1-60: The seconds ("0", "1", ..., "59")
+- Object 61: End-of-group marker
+
+### Extensions
+
+The minute object includes sample extensions:
+
+```cpp
+static const Extensions kExtensions{
+    std::vector<Extension>{
+        {0xacedecade, 1977},  // Integer extension
+        {0xdeadbeef, folly::IOBuf::copyBuffer(extTestBuff, sizeof(extTestBuff))}  // Data extension
+    },
+    {} // empty immutable extensions
+};
+```
+
+See: `MoQDateServer.cpp:53-60`
+
+## Key Concepts Demonstrated
+
+<AccordionGroup>
+  <Accordion title="Publisher Implementation">
+    Shows how to implement the `Publisher` interface with:
+    - Subscribe handling
+    - Fetch (historical data) support
+    - Track status reporting
+    - Largest object tracking
+  </Accordion>
+
+  <Accordion title="MoQForwarder">
+    Uses `MoQForwarder` to broadcast objects to multiple subscribers efficiently:
+    ```cpp
+    MoQForwarder forwarder_(dateTrackName());
+    forwarder_.addSubscriber(session, subReq, consumer);
+    ```
+  </Accordion>
+
+  <Accordion title="Group and Object Organization">
+    Demonstrates organizing time-series data into groups (minutes) and objects (seconds).
+  </Accordion>
+
+  <Accordion title="Object Extensions">
+    Shows how to attach both integer and binary extensions to objects for metadata.
+  </Accordion>
+
+  <Accordion title="Relay Publishing">
+    Optional relay mode demonstrates upstream publishing to a relay server.
+  </Accordion>
+</AccordionGroup>
+
+## Using with a Relay
+
+You can configure the Date Server to publish through an upstream relay:
+
+```bash
+# Start the relay first
+$MOXYGEN_BUILD_PATH/moxygen/relay/moqrelayserver \
+  --cert ./certs/certificate.pem \
+  --key ./certs/certificate.key \
+  --endpoint "/moq" \
+  --port 4433
+
+# Start date server publishing to relay
+$MOXYGEN_BUILD_PATH/moxygen/samples/date/moqdateserver \
+  --insecure \
+  --relay_url "https://localhost:4433/moq" \
+  --publish \
+  --ns "moq-date"
+```
+
+<Warning>
+  When using `--relay_url`, the Date Server acts as both a server (for direct clients) and a client (publishing to the relay).
+</Warning>
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Connection refused">
+    Ensure the server is running and the port is not already in use:
+    ```bash
+    lsof -i :4433
+    ```
+  </Accordion>
+
+  <Accordion title="Certificate errors">
+    Generate certificates if they don't exist:
+    ```bash
+    cd scripts
+    ./create-server-certs.sh
+    ```
+    Use `--insecure` flag when testing with self-signed certificates.
+  </Accordion>
+
+  <Accordion title="No data received">
+    Check that the namespace and track name match between server and client:
+    - Server uses namespace from `-ns` flag (default: `moq-date`)
+    - Track name is always `date`
+  </Accordion>
+</AccordionGroup>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Text Client" icon="terminal" href="/samples/text-client">
+    Learn how to subscribe to tracks
+  </Card>
+  <Card title="Publisher API" icon="book" href="/api-reference/publisher">
+    Explore the Publisher interface
+  </Card>
+</CardGroup>

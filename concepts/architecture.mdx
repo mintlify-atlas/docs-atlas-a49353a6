@@ -1,0 +1,241 @@
+---
+title: Architecture Overview
+description: Core architecture and design principles of Moxygen
+---
+
+## Overview
+
+**Moxygen** is a general-purpose C++ library for implementing [MOQT (Media over QUIC Transport)](https://datatracker.ietf.org/doc/draft-ietf-moq-transport/) applications. It provides a complete implementation of the MOQT protocol with flexible, composable APIs for building publishers, subscribers, relays, and custom media delivery applications.
+
+The library is designed around two fundamental principles:
+
+1. **Symmetric APIs**: Publisher and Subscriber interfaces are symmetric, enabling components to be easily chained together for filtering, proxying, and relay scenarios
+2. **Transport Agnostic**: Core protocol logic is decoupled from transport via the `proxygen::WebTransport` interface, supporting HTTP/3 WebTransport, native QUIC, and alternative implementations
+
+## Control Plane vs Data Plane
+
+Moxygen separates concerns into two distinct layers:
+
+### Control Plane API
+
+The control plane defines how publishers and subscribers establish communication and manage tracks. It handles:
+
+- **Subscription lifecycle**: SUBSCRIBE, SUBSCRIBE_OK, UNSUBSCRIBE
+- **Fetch requests**: FETCH for historical data retrieval
+- **Namespace management**: PUBLISH_NAMESPACE, SUBSCRIBE_NAMESPACE for track discovery
+- **Track status**: Querying track availability and metadata
+- **Request updates**: Modifying subscription parameters (range, priority, forwarding preferences)
+
+Control plane operations are asynchronous coroutines that return structured results:
+
+```cpp
+// Subscribe to a track
+auto subscribeResult = co_await session->subscribe(
+    SubscribeRequest{...},
+    trackConsumer
+);
+
+if (subscribeResult.hasValue()) {
+    auto handle = subscribeResult.value();
+    // Use handle to unsubscribe or update
+}
+```
+
+<Info>Control plane APIs use folly coroutines for async completion and enforce correctness by requiring proper response messages (e.g., `Expected<SubscribeOk, RequestError>`).</Info>
+
+### Data Plane API
+
+The data plane defines how objects flow through the system via consumer interfaces:
+
+- **TrackConsumer**: Receives objects from subscriptions across all groups and subgroups
+- **SubgroupConsumer**: Handles object delivery within a single subgroup (group + subgroup ID)
+- **FetchConsumer**: Receives objects from FETCH requests with backpressure support
+
+Data plane interfaces support multiple delivery modes:
+- Complete objects on dedicated streams
+- Streamed objects delivered in chunks
+- Unreliable datagram delivery
+- Status messages (EndOfGroup, EndOfTrack)
+
+See [Flow Control](/concepts/flow-control) for details on managing data plane backpressure.
+
+## Symmetric API Design
+
+The symmetric design enables powerful composition patterns:
+
+```
+Subscriber calls:                Publisher implements:
+session->subscribe(...)    →     myPublisher.subscribe(...)
+                           ←     returns SubscriptionHandle
+
+Publisher calls:                 Subscriber implements:
+session->publishNamespace(...) → mySubscriber.publishNamespace(...)
+                               ← returns PublishNamespaceHandle
+```
+
+This symmetry allows components to be chained:
+- **Filters**: Receive data, process it, republish to downstream consumers
+- **Relays**: Implement both Publisher and Subscriber to forward data between sessions
+- **Caches**: Store objects and replay them to new subscribers
+- **Transcoders**: Receive one format, transform, publish another format
+
+**Example chain**: `Publisher → Filter → Relay → Cache → Subscriber`
+
+Each component in the chain:
+1. Implements the consumer interface to receive data from upstream
+2. Implements the publisher interface to serve data to downstream
+3. Can modify, filter, or cache data in between
+
+## Component Composition
+
+### MoQSession: The Core Component
+
+`MoQSession` is the primary class implementing the MOQT protocol. It inherits from both `Publisher` and `Subscriber`, making it the key component for MOQT communication.
+
+**Key Features:**
+- **Dual Role**: Implements both publisher and subscriber interfaces
+- **Transport Agnostic**: Operates over any `proxygen::WebTransport` implementation
+- **Extensible**: Applications set custom handlers via `setPublishHandler()` and `setSubscribeHandler()`
+- **Coroutine-Based**: Uses folly coroutines for async operations
+- **Version Negotiation**: Supports multiple MOQT protocol versions
+
+**Setup Flow:**
+
+```cpp
+// 1. Create session with transport and executor
+auto session = std::make_shared<MoQSession>(wt, executor);
+
+// 2. Set custom handlers (optional)
+session->setPublishHandler(myPublisher);
+session->setSubscribeHandler(mySubscriber);
+
+// 3. Start protocol negotiation
+session->start();
+
+// 4. Exchange setup messages
+auto serverSetup = co_await session->setup(ClientSetup{...});
+
+// 5. Begin subscribing and publishing
+```
+
+### MoQRelaySession: Full Namespace Support
+
+While `MoQSession` returns `NOT_SUPPORTED` for namespace operations (suitable for simple clients), `MoQRelaySession` extends it with full namespace publishing functionality:
+
+- **`publishNamespace()`**: Forward namespace availability to subscribers
+- **`subscribeNamespace()`**: Subscribe to namespace prefixes
+- Namespace state management (tracking, publish callbacks)
+
+**Use Cases:**
+- Relay servers forwarding namespace availability between publishers and subscribers
+- Applications needing dynamic track discovery
+- Multi-hop delivery scenarios
+
+## Transport Abstraction
+
+The core protocol logic is separated from transport via the `proxygen::WebTransport` interface, which provides:
+
+- Bidirectional and unidirectional streams
+- Datagrams
+- Flow control and backpressure
+
+This abstraction allows moxygen to work with multiple QUIC implementations:
+
+### HTTP/3 WebTransport (Default)
+
+**MoQClient** and **MoQServer** use Proxygen's HTTP/3 WebTransport implementation:
+
+- **MoQClient**: Connects to HTTP/3 servers via `proxygen::URL`
+  - Performs QUIC connection and HTTP/3 WebTransport session setup
+  - Returns a `MoQSession` ready for MOQT communication
+
+- **MoQServer**: Accepts HTTP/3 WebTransport connections
+  - Listens on a socket address
+  - Handles `/connect` requests for WebTransport
+  - Creates `MoQSession` for each accepted connection
+  - Based on Proxygen's HQServer infrastructure
+
+### Native QUIC via QuicWebTransport
+
+- **QuicWebTransport**: Wraps mvfst (Meta's QUIC implementation) as a `WebTransport`
+- Used internally by MoQClient/MoQServer
+- Enables native QUIC support without HTTP layer overhead
+
+## Threading Model
+
+<Warning>
+**Critical Constraint**: Each `MoQSession` MUST only be accessed from the thread in which it was created.
+</Warning>
+
+This constraint simplifies synchronization and avoids locking overhead:
+
+- Sessions are bound to an executor's event loop thread
+- All callbacks and coroutines run on the session's thread
+- No internal locking required
+
+Applications using multiple threads must:
+- Create separate sessions per thread, OR
+- Ensure all session access is dispatched to the correct thread
+
+**Multi-Threaded Server Example:**
+
+```cpp
+// Each worker thread has its own event base
+std::vector<folly::EventBase*> evbs = server->getWorkerEvbs();
+
+// Each accepted connection is assigned to a worker thread
+// The MoQSession for that connection lives on that thread
+// All operations for that session happen on its thread
+```
+
+**Implications:**
+- Simple and lock-free within a session
+- Natural scaling via multiple sessions across threads
+- Care needed when coordinating across sessions (use thread-safe queues, etc.)
+
+## Statistics and Monitoring
+
+### MoQStats Interface
+
+Built-in stats callbacks for monitoring:
+
+- **MoQPublisherStatsCallback**: Track publishing metrics
+  - Subscription stream lifecycle
+  - Object delivery events
+  - Errors and failures
+
+- **MoQSubscriberStatsCallback**: Track subscription metrics
+  - Stream open/close events
+  - Object reception
+  - Buffering and flow control
+
+Register stats callbacks with your session:
+
+```cpp
+session->setPublisherStatsCallback(myPublisherStats);
+session->setSubscriberStatsCallback(mySubscriberStats);
+```
+
+### MLogger Integration
+
+Structured logging via MLogger for debugging:
+- Records protocol events, state transitions, errors
+- Can be serialized for offline analysis
+- Useful for debugging complex relay scenarios
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="MOQT Protocol" icon="network-wired" href="/concepts/moqt-protocol">
+    Learn about MOQT protocol features and operations
+  </Card>
+  <Card title="Publisher & Subscriber" icon="arrows-left-right" href="/concepts/publisher-subscriber">
+    Understand the symmetric interface design
+  </Card>
+  <Card title="Relay & Forwarding" icon="server" href="/concepts/relay-forwarding">
+    Build relay servers and forwarders
+  </Card>
+  <Card title="Flow Control" icon="gauge-high" href="/concepts/flow-control">
+    Manage backpressure and buffering
+  </Card>
+</CardGroup>

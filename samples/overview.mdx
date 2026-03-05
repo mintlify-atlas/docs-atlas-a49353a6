@@ -1,0 +1,127 @@
+---
+title: Sample Applications Overview
+description: Explore working examples of MOQT implementations in Moxygen
+---
+
+Moxygen includes several sample applications that demonstrate different aspects of the MOQT protocol. These samples serve as both learning tools and starting points for building your own MOQT applications.
+
+## Available Samples
+
+### Date Server & Text Client
+
+The simplest demonstration of MOQT publish/subscribe functionality.
+
+- **Date Server** - A server that broadcasts the current date and time every second
+- **Text Client** - A client that subscribes to text-based tracks and displays received data
+
+These samples are perfect for:
+- Understanding basic MOQT concepts
+- Learning the publisher/subscriber pattern
+- Testing your Moxygen installation
+- Debugging MOQT connections
+
+[Learn more about the Date Server →](/samples/date-server)
+
+[Learn more about the Text Client →](/samples/text-client)
+
+### Chat Client
+
+A bidirectional chat application demonstrating simultaneous publishing and subscribing.
+
+- Real-time messaging between multiple clients
+- Demonstrates both Publisher and Subscriber roles in one application
+- Shows namespace-based discovery
+- Handles multiple simultaneous connections
+
+This sample is ideal for:
+- Understanding bidirectional MOQT communication
+- Learning namespace management
+- Building interactive applications
+- Implementing presence and discovery patterns
+
+[Learn more about the Chat Client →](/samples/chat-client)
+
+### FLV Streaming
+
+Media streaming samples for testing MOQT with real audio/video content.
+
+- **MoQFlvStreamerClient** - Publishes FLV video to a MOQT relay
+- **MoQFlvReceiverClient** - Subscribes to and receives FLV video streams
+
+These samples demonstrate:
+- Media streaming over MOQT
+- MoQMi media packaging format
+- Integration with FFmpeg
+- Live and VOD streaming scenarios
+- Browser-to-app and app-to-browser workflows
+
+[Learn more about FLV Streaming →](/samples/flv-streaming)
+
+## Prerequisites
+
+Before running any samples, ensure you have:
+
+1. **Built Moxygen** following the [installation guide](/getting-started/installation)
+
+2. **Generated certificates** for TLS connections:
+   ```bash
+   cd scripts
+   ./create-server-certs.sh
+   ```
+
+3. **Set the build path** environment variable:
+   ```bash
+   MOXYGEN_BUILD_PATH=`./build/fbcode_builder/getdeps.py show-build-dir moxygen`
+   ```
+
+<Note>
+  The `--insecure` flag is used in sample commands to skip certificate validation with self-signed certificates. **Never use this flag in production.**
+</Note>
+
+## Sample Structure
+
+All sample applications are located in the `moxygen/samples/` directory:
+
+```
+moxygen/samples/
+├── date/                    # Date server
+├── text-client/             # Text subscriber client
+├── chat/                    # Bidirectional chat
+├── flv_streamer_client/     # FLV publisher
+└── flv_receiver_client/     # FLV subscriber
+```
+
+## Learning Path
+
+We recommend exploring the samples in this order:
+
+1. **Start with Date Server + Text Client** to understand basic pub/sub
+2. **Move to Chat Client** to learn bidirectional communication
+3. **Try FLV Streaming** to explore media applications
+
+## Common Flags
+
+Most samples share common command-line flags:
+
+| Flag | Description | Default |
+|------|-------------|----------|
+| `--connect_url` | URL of the MOQT server | `https://localhost:4433/moq` |
+| `--insecure` | Skip certificate validation | `false` |
+| `--connect_timeout` | Connection timeout in ms | `1000` |
+| `--transaction_timeout` | Transaction timeout in seconds | `120` |
+| `--versions` | Comma-separated MOQT draft versions | All supported |
+| `--logging` | Log level (DBG1, DBG4, INFO, etc.) | INFO |
+
+## Next Steps
+
+<CardGroup cols={3}>
+  <Card title="Date Server" icon="clock" href="/samples/date-server">
+    Simple time broadcasting server
+  </Card>
+  <Card title="Text Client" icon="terminal" href="/samples/text-client">
+    Subscribe to text tracks
+  </Card>
+  <Card title="Chat Client" icon="comments" href="/samples/chat-client">
+    Bidirectional messaging
+  </Card>
+</CardGroup>

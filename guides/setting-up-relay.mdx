@@ -1,0 +1,374 @@
+---
+title: Setting Up a Relay
+description: Configure and deploy a MoQ relay server for multi-client scenarios
+---
+
+A MoQ relay server routes subscriptions between publishers and subscribers, enables namespace discovery, and optionally caches objects for improved performance.
+
+## Overview
+
+The `MoQRelayServer` provides:
+- Namespace-based routing between publishers and subscribers
+- PUBLISH_NAMESPACE and SUBSCRIBE_NAMESPACE support
+- Optional object caching with configurable limits
+- Multi-client fan-out capabilities
+- Session management and cleanup
+
+## Basic Setup
+
+<Steps>
+
+### Step 1: Create the Relay Server
+
+Extend `MoQServer` and integrate `MoQRelay`:
+
+```cpp
+#include "moxygen/MoQServer.h"
+#include "moxygen/relay/MoQRelay.h"
+#include "moxygen/MoQRelaySession.h"
+
+class MoQRelayServer : public MoQServer {
+ public:
+  // Constructor with certificate paths
+  MoQRelayServer(const std::string& cert, const std::string& key)
+      : MoQServer(
+            quic::samples::createFizzServerContext(
+                []() {
+                  std::vector<std::string> alpns = {"h3"};
+                  auto moqt = getMoqtProtocols(FLAGS_versions, true);
+                  alpns.insert(alpns.end(), moqt.begin(), moqt.end());
+                  return alpns;
+                }(),
+                fizz::server::ClientAuthMode::Optional,
+                cert,
+                key),
+            FLAGS_endpoint) {}
+
+  // Handle new client connections
+  void onNewSession(std::shared_ptr<MoQSession> clientSession) override {
+    // Set relay as both publisher and subscriber handler
+    clientSession->setPublishHandler(relay_);
+    clientSession->setSubscribeHandler(relay_);
+  }
+
+ protected:
+  // Create relay sessions instead of base sessions
+  std::shared_ptr<MoQSession> createSession(
+      folly::MaybeManagedPtr<proxygen::WebTransport> wt,
+      std::shared_ptr<MoQExecutor> executor) override {
+    return std::make_shared<MoQRelaySession>(
+        folly::MaybeManagedPtr<proxygen::WebTransport>(std::move(wt)),
+        *this,
+        std::move(executor));
+  }
+
+ private:
+  std::shared_ptr<MoQRelay> relay_{std::make_shared<MoQRelay>(
+      FLAGS_max_cached_tracks,
+      FLAGS_max_cached_groups_per_track)};
+};
+```
+
+### Step 2: Configure Command-Line Flags
+
+Define configuration options:
+
+```cpp
+DEFINE_string(cert, "", "Cert path");
+DEFINE_string(key, "", "Key path");
+DEFINE_string(endpoint, "/moq-relay", "End point");
+DEFINE_int32(port, 9668, "Relay Server Port");
+DEFINE_bool(enable_cache, true, "Enable relay cache");
+DEFINE_string(
+    versions,
+    "",
+    "Comma-separated MoQ draft versions (e.g. \"14,16\")");
+DEFINE_int32(
+    max_cached_tracks,
+    100,
+    "Maximum number of cached tracks (0 to disable caching)");
+DEFINE_int32(
+    max_cached_groups_per_track,
+    3,
+    "Maximum groups per track in cache");
+DEFINE_bool(
+    insecure,
+    false,
+    "Use insecure verifier (skip certificate validation)");
+```
+
+### Step 3: Start the Server
+
+Initialize and run the relay:
+
+```cpp
+int main(int argc, char* argv[]) {
+  folly::Init init(&argc, &argv, true);
+
+  // Create relay server
+  std::shared_ptr<MoQRelayServer> moqRelayServer = nullptr;
+  if (FLAGS_insecure) {
+    moqRelayServer = std::make_shared<MoQRelayServer>();
+  } else {
+    moqRelayServer = std::make_shared<MoQRelayServer>(
+        FLAGS_cert, FLAGS_key);
+  }
+
+  // Start listening on port
+  folly::SocketAddress addr("::", FLAGS_port);
+  moqRelayServer->start(addr);
+
+  XLOG(INFO) << "Relay server listening on port " << FLAGS_port;
+
+  // Run event loop
+  folly::EventBase evb;
+  evb.loopForever();
+  return 0;
+}
+```
+
+</Steps>
+
+## Namespace Routing
+
+### Publisher Workflow
+
+1. **Connect to relay**
+2. **Publish namespace** to announce available tracks:
+
+```cpp
+// Publisher announces namespace
+PublishNamespace ann{
+    RequestID(0),
+    TrackNamespace("my-app", "/"),
+    true /* forward */,
+    {}};
+
+auto annResp = co_await session->publishNamespace(std::move(ann));
+if (annResp.hasValue()) {
+  publishNamespaceHandle_ = std::move(annResp.value());
+  XLOG(INFO) << "Published namespace my-app";
+}
+```
+
+3. **Handle subscribe requests** when subscribers discover the namespace
+
+### Subscriber Workflow
+
+1. **Connect to relay**
+2. **Subscribe to namespace** to discover available tracks:
+
+```cpp
+// Subscriber subscribes to namespace prefix
+SubscribeNamespace subAnn{
+    RequestID(0),
+    TrackNamespace("my-app", "/"),
+    true /* forward */,
+    {}};
+
+auto res = co_await session->subscribeNamespace(subAnn, nullptr);
+if (res.hasValue()) {
+  XLOG(INFO) << "Subscribed to namespace my-app";
+}
+```
+
+3. **Receive PUBLISH messages** when publishers announce tracks
+4. **Subscribe to specific tracks** within the namespace
+
+### How Routing Works
+
+The relay maintains a namespace tree:
+- Publishers register namespaces via `publishNamespace()`
+- Subscribers discover namespaces via `subscribeNamespace()`
+- The relay routes `subscribe()` requests to the appropriate publisher session
+- Data flows: Publisher → Relay → Subscribers
+
+```
+┌───────────┐                    ┌───────────┐
+│ Publisher │ ──publish NS──→    │   Relay   │
+│           │ ←─subscribe req──  │           │
+│           │ ──objects──→       │           │
+└───────────┘                    └─────┬─────┘
+                                       │
+                              ┌────────┴────────┐
+                              ↓                 ↓
+                        ┌──────────┐      ┌──────────┐
+                        │Subscriber│      │Subscriber│
+                        │    1     │      │    2     │
+                        └──────────┘      └──────────┘
+```
+
+## Caching Configuration
+
+Enable caching to serve historical data to new subscribers:
+
+<Accordion title="Cache Configuration Options">
+
+```cpp
+// In MoQRelay constructor
+auto relay = std::make_shared<MoQRelay>(
+    max_cached_tracks,        // Total tracks to cache
+    max_cached_groups_per_track); // Groups per track
+
+// Examples:
+// Small: 10 tracks, 2 groups each = ~20 groups total
+// Medium: 100 tracks, 3 groups each = ~300 groups total
+// Large: 1000 tracks, 5 groups each = ~5000 groups total
+
+// Disable caching:
+auto relay = std::make_shared<MoQRelay>(0, 0);
+```
+
+</Accordion>
+
+### Cache Behavior
+
+- **Automatic population**: Objects are cached as they pass through
+- **LRU eviction**: Oldest groups evicted when limits reached
+- **New subscriber benefit**: Receive cached groups immediately
+- **Transparent**: Publishers and subscribers don't need cache awareness
+
+<Note>
+Caching is particularly useful for:
+- Keyframe storage in video streams (cache GOPs)
+- Recent message history in chat applications
+- Reference data that doesn't change frequently
+</Note>
+
+## Multi-Client Scenarios
+
+### Fan-Out to Multiple Subscribers
+
+The relay automatically handles fan-out:
+
+```cpp
+// Publisher publishes once
+publisher->objectStream(header, payload);
+
+// Relay forwards to all subscribed clients
+// No additional code needed - handled by MoQForwarder
+```
+
+### Publisher to Multiple Relays
+
+Publishers can connect to multiple relays:
+
+```cpp
+// Connect to relay 1
+auto relayClient1 = std::make_unique<MoQRelayClient>(...);
+co_await relayClient1->setup(publisher, nullptr, ...);
+
+// Connect to relay 2
+auto relayClient2 = std::make_unique<MoQRelayClient>(...);
+co_await relayClient2->setup(publisher, nullptr, ...);
+
+// Publish namespace to both
+relayClient1->run(publisher, {TrackNamespace("my-app", "/")});
+relayClient2->run(publisher, {TrackNamespace("my-app", "/")});
+```
+
+## Production Considerations
+
+<Warning>
+**Security**: Always use proper certificates in production. The `--insecure` flag is for testing only.
+</Warning>
+
+### Resource Limits
+
+Configure per-session and per-subscription limits in `MoQSettings`:
+
+```cpp
+MoQSettings settings;
+settings.perSubscription = 10 * 1024 * 1024; // 10 MB per subscription
+settings.perSession = 100 * 1024 * 1024;     // 100 MB per session
+
+// Apply to sessions
+session->setSettings(settings);
+```
+
+### Monitoring
+
+Implement stats callbacks:
+
+```cpp
+class RelayStatsCallback : public MoQPublisherStatsCallback,
+                            public MoQSubscriberStatsCallback {
+ public:
+  void onObjectPublished(TrackAlias alias, uint64_t group, uint64_t obj) override {
+    // Track published objects
+    publishedCount_++;
+  }
+
+  void onObjectReceived(TrackAlias alias, uint64_t group, uint64_t obj) override {
+    // Track received objects
+    receivedCount_++;
+  }
+
+ private:
+  std::atomic<uint64_t> publishedCount_{0};
+  std::atomic<uint64_t> receivedCount_{0};
+};
+
+// Register with session
+auto stats = std::make_shared<RelayStatsCallback>();
+session->setPublisherStatsCallback(stats);
+session->setSubscriberStatsCallback(stats);
+```
+
+### Logging
+
+Enable MLogger for debugging:
+
+```cpp
+#include <moxygen/mlog/FileMLoggerFactory.h>
+
+auto loggerFactory = std::make_shared<moxygen::FileMLoggerFactory>(
+    "/var/log/moq/relay.mlog",
+    moxygen::VantagePoint::SERVER);
+
+server->setMLoggerFactory(loggerFactory);
+```
+
+## Running the Relay
+
+### Generate Certificates
+
+```bash
+# Generate self-signed cert (testing only)
+openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem \
+  -days 365 -nodes -subj "/CN=localhost"
+```
+
+### Start Relay Server
+
+```bash
+# Production
+./moqrelayserver \
+  --cert ./certs/certificate.pem \
+  --key ./certs/certificate.key \
+  --endpoint "/moq" \
+  --port 4433 \
+  --max_cached_tracks 100 \
+  --max_cached_groups_per_track 3
+
+# Development/Testing
+./moqrelayserver \
+  --insecure \
+  --endpoint "/moq" \
+  --port 4433 \
+  --max_cached_tracks 10
+```
+
+## Complete Example
+
+See the full relay implementation:
+- Server: `moxygen/relay/MoQRelayServer.cpp`
+- Relay logic: `moxygen/relay/MoQRelay.h` and `MoQRelay.cpp`
+- Cache: `moxygen/relay/MoQCache.h`
+- Forwarder: `moxygen/relay/MoQForwarder.h`
+
+## Next Steps
+
+- Learn about [Building a Publisher](/guides/building-publisher)
+- Explore [Building a Subscriber](/guides/building-subscriber)
+- Understand [Media Streaming](/guides/media-streaming) through relays

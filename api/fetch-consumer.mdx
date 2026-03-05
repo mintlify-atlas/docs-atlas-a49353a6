@@ -1,0 +1,448 @@
+---
+title: 'FetchConsumer'
+description: 'Interface for publishing and receiving objects in response to FETCH requests'
+---
+
+## Overview
+
+The `FetchConsumer` interface handles object delivery for FETCH requests. It is similar to `SubgroupConsumer` but operates across multiple groups and provides explicit backpressure support since fetches are not intended for real-time consumption.
+
+This interface is used bidirectionally:
+
+- **For publishers**: Methods are invoked to send historical objects to fetch requesters
+- **For subscribers**: Methods are invoked when fetch response data is received
+
+## Key Differences from SubgroupConsumer
+
+<Info>
+**FetchConsumer vs SubgroupConsumer:**
+
+1. **Scope**: FetchConsumer handles objects across multiple groups, while SubgroupConsumer is scoped to a single subgroup
+2. **Backpressure**: FetchConsumer has explicit `awaitReadyToConsume()` for backpressure control
+3. **Ordering**: FetchConsumer enforces strict ordering across groups - group IDs must be increasing
+4. **Use Case**: FetchConsumer is for historical/on-demand data, not real-time streaming
+</Info>
+
+## API Semantics
+
+The `FetchConsumer` enforces strict ordering requirements:
+
+<Warning>
+**Critical Requirements:**
+
+- Object IDs must be strictly increasing within each group
+- Group IDs must be non-decreasing (cannot deliver a group smaller than the previously delivered group)
+- When streaming objects with `beginObject()`/`objectPayload()`, the total bytes delivered must exactly match the length specified in `beginObject()`
+- It's an error to begin delivering any object/status or close the stream in the middle of a streaming object
+- Publishers should respect `BLOCKED` errors and use `awaitReadyToConsume()` to resume
+</Warning>
+
+## Flow Control
+
+Fetches apply backpressure to publishers using a write(2)-like API:
+
+1. Methods return `MoQPublishError` with `code=BLOCKED` when the consumer cannot accept more data
+2. Publishers must stop invoking methods when `BLOCKED` is returned
+3. Use `awaitReadyToConsume()` to wait until it's safe to resume
+4. When used as a read interface, applications can return `BLOCKED` to initiate backpressure, though the library may still invoke additional APIs for already-buffered data
+
+## Methods
+
+### object
+
+Delivers a complete object in the FETCH response.
+
+```cpp
+folly::Expected<folly::Unit, MoQPublishError> object(
+    uint64_t groupID,
+    uint64_t subgroupID,
+    uint64_t objectID,
+    Payload payload,
+    Extensions extensions = noExtensions(),
+    bool finFetch = false,
+    bool forwardingPreferenceIsDatagram = false)
+```
+
+<ParamField path="groupID" type="uint64_t" required>
+  The group identifier. Must be greater than or equal to the last delivered group ID.
+</ParamField>
+
+<ParamField path="subgroupID" type="uint64_t" required>
+  The subgroup identifier within the group.
+</ParamField>
+
+<ParamField path="objectID" type="uint64_t" required>
+  The object identifier. Must be strictly larger than the last delivered object ID within this group.
+</ParamField>
+
+<ParamField path="payload" type="Payload" required>
+  The complete object payload data.
+</ParamField>
+
+<ParamField path="extensions" type="Extensions" default="noExtensions()">
+  Optional extensions to attach to this object.
+</ParamField>
+
+<ParamField path="finFetch" type="bool" default="false">
+  If true, indicates this is the last object in the FETCH response and closes the stream.
+</ParamField>
+
+<ParamField path="forwardingPreferenceIsDatagram" type="bool" default="false">
+  Indicates the original forwarding preference for this object was datagram.
+</ParamField>
+
+<ResponseField name="return" type="folly::Expected<folly::Unit, MoQPublishError>">
+  Returns `folly::Unit` on success, or `MoQPublishError::BLOCKED` when the consumer cannot accept more data, or other `MoQPublishError` on failure.
+</ResponseField>
+
+### beginObject
+
+Begins delivering a large object that will be streamed in multiple chunks.
+
+```cpp
+folly::Expected<folly::Unit, MoQPublishError> beginObject(
+    uint64_t groupID,
+    uint64_t subgroupID,
+    uint64_t objectID,
+    uint64_t length,
+    Payload initialPayload,
+    Extensions extensions = noExtensions())
+```
+
+<ParamField path="groupID" type="uint64_t" required>
+  The group identifier.
+</ParamField>
+
+<ParamField path="subgroupID" type="uint64_t" required>
+  The subgroup identifier.
+</ParamField>
+
+<ParamField path="objectID" type="uint64_t" required>
+  The object identifier. Must be strictly larger than the last delivered object ID within this group.
+</ParamField>
+
+<ParamField path="length" type="uint64_t" required>
+  The total length of the object in bytes. The sum of all payload chunks must exactly equal this value.
+</ParamField>
+
+<ParamField path="initialPayload" type="Payload" required>
+  The first chunk of the object's payload data.
+</ParamField>
+
+<ParamField path="extensions" type="Extensions" default="noExtensions()">
+  Optional extensions to attach to this object.
+</ParamField>
+
+<ResponseField name="return" type="folly::Expected<folly::Unit, MoQPublishError>">
+  Returns `folly::Unit` on success, or `MoQPublishError::BLOCKED` when backpressure is needed, or other `MoQPublishError` on failure.
+</ResponseField>
+
+### objectPayload
+
+Delivers the next chunk of data for a streaming object.
+
+```cpp
+folly::Expected<ObjectPublishStatus, MoQPublishError> objectPayload(
+    Payload payload,
+    bool finSubgroup = false)
+```
+
+<ParamField path="payload" type="Payload" required>
+  The next chunk of object data.
+</ParamField>
+
+<ParamField path="finSubgroup" type="bool" default="false">
+  If true and this is the final chunk, also signals the end of this subgroup.
+</ParamField>
+
+<ResponseField name="return" type="folly::Expected<ObjectPublishStatus, MoQPublishError>">
+  Returns:
+  - `ObjectPublishStatus::IN_PROGRESS` if more data is expected
+  - `ObjectPublishStatus::DONE` if the object is now complete
+  - `MoQPublishError::BLOCKED` when backpressure is needed
+  - Other `MoQPublishError` on failure
+</ResponseField>
+
+### endOfGroup
+
+Delivers an Object Status message indicating the end of a group.
+
+```cpp
+folly::Expected<folly::Unit, MoQPublishError> endOfGroup(
+    uint64_t groupID,
+    uint64_t subgroupID,
+    uint64_t objectID,
+    bool finFetch = false)
+```
+
+<ParamField path="groupID" type="uint64_t" required>
+  The group identifier for the EndOfGroup status.
+</ParamField>
+
+<ParamField path="subgroupID" type="uint64_t" required>
+  The subgroup identifier.
+</ParamField>
+
+<ParamField path="objectID" type="uint64_t" required>
+  The object ID for the EndOfGroup status message.
+</ParamField>
+
+<ParamField path="finFetch" type="bool" default="false">
+  If true, this also signals the end of the entire FETCH response.
+</ParamField>
+
+<ResponseField name="return" type="folly::Expected<folly::Unit, MoQPublishError>">
+  Returns `folly::Unit` on success, or `MoQPublishError` on failure.
+</ResponseField>
+
+### endOfTrackAndGroup
+
+Delivers an Object Status message indicating the end of both the track and the group.
+
+```cpp
+folly::Expected<folly::Unit, MoQPublishError> endOfTrackAndGroup(
+    uint64_t groupID,
+    uint64_t subgroupID,
+    uint64_t objectID)
+```
+
+<ParamField path="groupID" type="uint64_t" required>
+  The group identifier.
+</ParamField>
+
+<ParamField path="subgroupID" type="uint64_t" required>
+  The subgroup identifier.
+</ParamField>
+
+<ParamField path="objectID" type="uint64_t" required>
+  The object ID for the EndOfTrackAndGroup status message.
+</ParamField>
+
+<ResponseField name="return" type="folly::Expected<folly::Unit, MoQPublishError>">
+  Returns `folly::Unit` on success, or `MoQPublishError` on failure.
+</ResponseField>
+
+<Info>
+This method implies `endOfFetch()` - the fetch stream will be closed after delivering this status.
+</Info>
+
+### endOfFetch
+
+Informs the consumer that the fetch is complete and closes the underlying stream.
+
+```cpp
+folly::Expected<folly::Unit, MoQPublishError> endOfFetch()
+```
+
+<ResponseField name="return" type="folly::Expected<folly::Unit, MoQPublishError>">
+  Returns `folly::Unit` on success, or `MoQPublishError` on failure.
+</ResponseField>
+
+<Warning>
+This method can only be called if the publisher knows the entire fetch has been delivered. If the consumer is writing, this closes the underlying transport stream.
+</Warning>
+
+### reset
+
+Terminates the fetch with an error and resets the underlying stream.
+
+```cpp
+void reset(ResetStreamErrorCode error)
+```
+
+<ParamField path="error" type="ResetStreamErrorCode" required>
+  The error code to report when resetting the stream.
+</ParamField>
+
+<Info>
+If the consumer is writing, this resets the transport stream with the given error code. The stream will be reliably delivered up to the last `checkpoint()`.
+</Info>
+
+### checkpoint
+
+Advances the reliable offset of the fetch stream to the current position.
+
+```cpp
+void checkpoint()
+```
+
+<Note>
+Checkpoints mark positions in the stream that will be reliably delivered even if the stream is later reset. Data written after the last checkpoint may be lost if `reset()` is called.
+</Note>
+
+### awaitReadyToConsume
+
+Waits for the fetch to become writable after receiving a `BLOCKED` error.
+
+```cpp
+folly::Expected<folly::SemiFuture<uint64_t>, MoQPublishError>
+awaitReadyToConsume()
+```
+
+<ResponseField name="return" type="folly::Expected<folly::SemiFuture<uint64_t>, MoQPublishError>">
+  Returns a `SemiFuture<uint64_t>` that completes when the consumer is ready to accept more data. The uint64_t value indicates available buffer space. Returns `MoQPublishError` if the fetch has been terminated.
+</ResponseField>
+
+<Info>
+**Critical for Flow Control**: Always call this method after receiving `MoQPublishError::BLOCKED` from any delivery method. Do not attempt to deliver more data until the returned future completes.
+</Info>
+
+### endOfUnknownRange
+
+Indicates that a range of objects is unknown and cannot be delivered.
+
+```cpp
+folly::Expected<folly::Unit, MoQPublishError> endOfUnknownRange(
+    uint64_t groupID,
+    uint64_t objectId,
+    bool finFetch = false)
+```
+
+<ParamField path="groupID" type="uint64_t" required>
+  The group identifier for the unknown range.
+</ParamField>
+
+<ParamField path="objectId" type="uint64_t" required>
+  The object ID indicating the end of the unknown range.
+</ParamField>
+
+<ParamField path="finFetch" type="bool" default="false">
+  If true, this also signals the end of the entire FETCH response.
+</ParamField>
+
+<ResponseField name="return" type="folly::Expected<folly::Unit, MoQPublishError>">
+  Returns `folly::Unit` on success, or `MoQPublishError` on failure.
+</ResponseField>
+
+<Note>
+The default implementation is a no-op. This is primarily a caching concern and may not need custom implementation for many use cases.
+</Note>
+
+## Usage Example with Backpressure
+
+```cpp
+auto publishFetch(
+    std::shared_ptr<FetchConsumer> consumer,
+    const FetchRequest& request) -> folly::coro::Task<void> {
+  
+  uint64_t currentGroup = request.startGroup;
+  uint64_t endGroup = request.endGroup.value_or(getCurrentGroupId());
+
+  while (currentGroup <= endGroup) {
+    auto objectsInGroup = getObjectsForGroup(currentGroup);
+    
+    for (const auto& obj : objectsInGroup) {
+      // Attempt to deliver the object
+      auto result = consumer->object(
+          currentGroup,
+          obj.subgroupId,
+          obj.objectId,
+          obj.payload.clone());
+      
+      if (result.hasError()) {
+        if (result.error().code == MoQPublishError::BLOCKED) {
+          // Consumer is not ready - wait for backpressure to clear
+          auto readyResult = consumer->awaitReadyToConsume();
+          if (readyResult.hasError()) {
+            // Fetch was cancelled or errored
+            co_return;
+          }
+          
+          // Wait for consumer to be ready
+          auto bufferSpace = co_await std::move(readyResult.value());
+          
+          // Retry the same object
+          result = consumer->object(
+              currentGroup,
+              obj.subgroupId,
+              obj.objectId,
+              obj.payload.clone());
+          
+          if (result.hasError()) {
+            // Still failed, abort
+            consumer->reset(ResetStreamErrorCode::INTERNAL_ERROR);
+            co_return;
+          }
+        } else {
+          // Other error, abort
+          consumer->reset(ResetStreamErrorCode::INTERNAL_ERROR);
+          co_return;
+        }
+      }
+    }
+    
+    currentGroup++;
+  }
+  
+  // Successfully delivered all objects
+  consumer->endOfFetch();
+}
+```
+
+## Strict Ordering Example
+
+```cpp
+// CORRECT: Groups are in increasing order
+consumer->object(100, 0, 0, payload1);  // group 100
+consumer->object(100, 0, 1, payload2);  // group 100, object IDs increasing
+consumer->object(101, 0, 0, payload3);  // group 101 (OK: >= previous group)
+consumer->object(101, 0, 1, payload4);  // group 101, object IDs increasing
+
+// INCORRECT: Would violate ordering
+// consumer->object(99, 0, 0, payload5);  // ERROR: group 99 < 101
+// consumer->object(101, 0, 0, payload6); // ERROR: object 0 <= last object 1 in group 101
+```
+
+## Streaming Large Objects
+
+```cpp
+auto streamLargeObject(
+    std::shared_ptr<FetchConsumer> consumer,
+    uint64_t groupId,
+    uint64_t subgroupId,
+    uint64_t objectId,
+    uint64_t totalSize) -> folly::coro::Task<void> {
+  
+  const size_t chunkSize = 64 * 1024; // 64KB chunks
+  auto firstChunk = readChunk(chunkSize);
+  
+  auto result = consumer->beginObject(
+      groupId, subgroupId, objectId, totalSize, std::move(firstChunk));
+  
+  if (result.hasError()) {
+    if (result.error().code == MoQPublishError::BLOCKED) {
+      co_await consumer->awaitReadyToConsume().value();
+      // Retry beginObject...
+    }
+    co_return;
+  }
+  
+  size_t delivered = firstChunk.length();
+  
+  while (delivered < totalSize) {
+    auto chunk = readChunk(std::min(chunkSize, totalSize - delivered));
+    auto status = consumer->objectPayload(std::move(chunk));
+    
+    if (status.hasError()) {
+      if (status.error().code == MoQPublishError::BLOCKED) {
+        co_await consumer->awaitReadyToConsume().value();
+        continue; // Retry
+      }
+      consumer->reset(ResetStreamErrorCode::INTERNAL_ERROR);
+      co_return;
+    }
+    
+    delivered += chunk.length();
+    
+    if (status.value() == ObjectPublishStatus::DONE) {
+      break;
+    }
+  }
+}
+```
+
+## See Also
+
+- [TrackConsumer](/api/track-consumer) - Interface for subscription-based delivery
+- [SubgroupConsumer](/api/subgroup-consumer) - Similar interface scoped to a single subgroup
+- [MoQSession fetch()](/api/moqsession#fetch) - Creating FETCH requests

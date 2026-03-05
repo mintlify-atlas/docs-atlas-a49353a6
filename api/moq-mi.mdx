@@ -1,0 +1,304 @@
+---
+title: "MoQMi"
+description: "Media packaging format for MOQT - MoqMi (Media over QUIC Media Interop)"
+---
+
+## Overview
+
+`MoQMi` implements the MoqMi media packaging format as defined in [draft-cenzano-moq-media-interop](https://datatracker.ietf.org/doc/draft-cenzano-moq-media-interop/). It provides a standardized way to package encoded media (video/audio) into MOQT objects.
+
+**Source**: `moxygen/moq_mi/MoQMi.h`
+
+## Key Concepts
+
+<CardGroup cols={2}>
+  <Card title="Media Items" icon="film">
+    Self-contained units of encoded media (video frames, audio frames)
+  </Card>
+  <Card title="GOP Structure" icon="table-cells">
+    Video groups align with GOPs (Group of Pictures) for efficient seeking
+  </Card>
+  <Card title="Codec Support" icon="video">
+    H.264/AVC and AAC-LC with standard headers (AVCDecoderRecord, ASC)
+  </Card>
+  <Card title="Timing Information" icon="clock">
+    Timestamps and durations for synchronization
+  </Card>
+</CardGroup>
+
+## MoqMi Group Structure
+
+### Video Track
+
+```
+Group N (GOP N):
+  Object 0: Video frame 0 (keyframe)
+  Object 1: Video frame 1
+  Object 2: Video frame 2
+  ...
+  Object M: Video frame M (last frame of GOP)
+```
+
+**Properties**:
+- Each group represents one GOP (starts with keyframe/IDR)
+- Each object is one encoded video frame
+- Groups enable efficient seeking to keyframes
+
+### Audio Track
+
+```
+Group N:
+  Object 0: Audio frame 0
+  Object 1: Audio frame 1
+  Object 2: Audio frame 2
+  ...
+```
+
+**Properties**:
+- Audio groups are typically time-based chunks
+- Each object is one audio frame (AAC access unit)
+- No strict alignment requirement with video
+
+## MediaItem Structure
+
+A `MediaItem` represents a single media frame:
+
+```cpp MediaItem.h
+struct MediaItem {
+  uint64_t groupId;
+  uint64_t objectId;
+  std::chrono::milliseconds timestamp;  // Presentation timestamp
+  std::chrono::milliseconds duration;   // Frame duration
+  bool keyframe;                        // True for video keyframes
+  Payload data;                         // Encoded media data
+};
+```
+
+<ParamField path="groupId" type="uint64_t">
+  MOQT group ID (typically GOP number for video)
+</ParamField>
+
+<ParamField path="objectId" type="uint64_t">
+  MOQT object ID (frame index within group)
+</ParamField>
+
+<ParamField path="timestamp" type="std::chrono::milliseconds">
+  Presentation timestamp (PTS)
+</ParamField>
+
+<ParamField path="duration" type="std::chrono::milliseconds">
+  Frame duration for timing calculations
+</ParamField>
+
+<ParamField path="keyframe" type="bool">
+  True for video keyframes/IDR frames
+</ParamField>
+
+<ParamField path="data" type="Payload">
+  Encoded media data (H.264 NAL units or AAC frames)
+</ParamField>
+
+## Codec Configuration
+
+### H.264/AVC Video
+
+MoqMi uses the same decoder configuration as FLV:
+
+```cpp
+// AVCDecoderConfigurationRecord contains:
+// - SPS (Sequence Parameter Set)
+// - PPS (Picture Parameter Set)
+// - Profile, level, etc.
+```
+
+The decoder record is typically sent:
+- As track-level metadata (in extensions)
+- Before the first video frame
+- When configuration changes
+
+### AAC-LC Audio
+
+Audio configuration uses AudioSpecificConfig (ASC):
+
+```cpp
+// AudioSpecificConfig contains:
+// - Sample rate
+// - Channel configuration
+// - Profile (AAC-LC = 2)
+```
+
+## Integration with FLV
+
+MoqMi works seamlessly with FLV format:
+
+### FLV → MoqMi (Streamer)
+
+```cpp flv_to_moqmi.cpp
+#include <moxygen/flv_parser/FlvReader.h>
+#include <moxygen/moq_mi/MoQMi.h>
+
+// Read FLV file
+FlvReader reader(flvFile);
+
+while (auto tag = reader.readTag()) {
+  if (tag->type == FlvTag::VIDEO) {
+    // Convert to MediaItem
+    MediaItem item{
+      .groupId = currentGop,
+      .objectId = frameInGop++,
+      .timestamp = std::chrono::milliseconds(tag->timestamp),
+      .keyframe = tag->isKeyframe(),
+      .data = std::move(tag->data)
+    };
+    
+    // Publish via MOQT
+    publishMediaItem(item);
+    
+    if (item.keyframe) {
+      currentGop++;
+      frameInGop = 0;
+    }
+  }
+}
+```
+
+### MoqMi → FLV (Receiver)
+
+```cpp moqmi_to_flv.cpp
+#include <moxygen/flv_parser/FlvWriter.h>
+#include <moxygen/moq_mi_to_flv/MoQMiToFlv.h>
+
+// Receive MediaItems via MOQT subscription
+void onMediaItem(const MediaItem& item) {
+  // Convert to FLV tag
+  FlvTag tag{
+    .type = FlvTag::VIDEO,
+    .timestamp = item.timestamp.count(),
+    .data = clone(item.data)
+  };
+  
+  flvWriter.writeTag(tag);
+}
+```
+
+## Usage in Sample Applications
+
+### MoQFlvStreamerClient
+
+Reads FLV, converts to MoqMi, publishes via MOQT:
+
+```cpp streamer_example.cpp
+// Parse FLV
+FlvStreamParser parser;
+parser.setOnVideoFrame([this](auto frame) {
+  // Map to MoqMi structure
+  auto mediaItem = convertToMediaItem(frame);
+  
+  // Publish as MOQT object
+  auto subgroup = forwarder->beginSubgroup(
+    mediaItem.groupId,
+    /* subgroup */ 0,
+    priority
+  ).value();
+  
+  subgroup->object(
+    mediaItem.objectId,
+    std::move(mediaItem.data),
+    extensions,
+    /* finSubgroup */ isLastInGroup
+  );
+});
+```
+
+### MoQFlvReceiverClient
+
+Subscribes via MOQT, converts from MoqMi, writes FLV:
+
+```cpp receiver_example.cpp
+// Receive MOQT objects
+void object(
+    uint64_t objectID,
+    Payload payload,
+    Extensions extensions,
+    bool finSubgroup) override {
+  
+  // Build MediaItem from MOQT object
+  MediaItem item{
+    .groupId = currentGroupId_,
+    .objectId = objectID,
+    .data = std::move(payload)
+  };
+  
+  // Convert to FLV and write
+  moqMiToFlv_->processMediaItem(item);
+}
+```
+
+## Extensions
+
+MoqMi uses MOQT extensions for metadata:
+
+```cpp
+Extensions videoExtensions{
+  // Delivery timeout
+  {kDeliveryTimeoutExtensionType, encodeVarInt(3000)},
+  
+  // Publisher priority
+  {kPublisherPriorityExtensionType, encodeVarInt(128)},
+  
+  // Group order
+  {kPublisherGroupOrderExtensionType, encodeVarInt(GroupOrder::OldestFirst)}
+};
+```
+
+## Track Naming Convention
+
+Typical MoqMi track structure:
+
+```
+Namespace: "my-stream"
+  Track: "video0"  (H.264 video)
+  Track: "audio0"  (AAC-LC audio)
+```
+
+Multi-quality:
+
+```
+Namespace: "my-stream"
+  Track: "video-1080p"
+  Track: "video-720p"
+  Track: "video-480p"
+  Track: "audio"
+```
+
+## Benefits of MoqMi Format
+
+<Accordion title="Streaming Friendly">
+  Low-latency encoding and decoding - no container overhead, frames can be processed as they arrive
+</Accordion>
+
+<Accordion title="Seek Efficiency">
+  Group structure (aligned with GOPs) enables efficient seeking to keyframes
+</Accordion>
+
+<Accordion title="Simple Format">
+  No complex container parsing - direct NAL unit / AAC frame mapping
+</Accordion>
+
+<Accordion title="Codec Header Reuse">
+  Uses existing FLV codec headers (AVCDecoderRecord, ASC) - no transcoding needed
+</Accordion>
+
+## Related Classes
+
+<CardGroup cols={3}>
+  <Card title="FLV Parser" href="/api/flv-parser">
+    FLV format integration
+  </Card>
+  <Card title="Media Streaming Guide" href="/guides/media-streaming">
+    Complete media streaming workflow
+  </Card>
+  <Card title="FLV Streaming Sample" href="/samples/flv-streaming">
+    Working FLV streamer/receiver examples
+  </Card>
+</CardGroup>

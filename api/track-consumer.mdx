@@ -1,0 +1,269 @@
+---
+title: 'TrackConsumer'
+description: 'Interface for publishing and receiving objects on a subscribed track'
+---
+
+## Overview
+
+The `TrackConsumer` interface represents a subscription to a track and handles the delivery of objects across all groups and subgroups within that track. This interface is used bidirectionally:
+
+- **For publishers**: Methods are invoked to send data to subscribers
+- **For subscribers**: Methods are invoked when data is received from publishers
+
+The interface supports multiple delivery modes (streams and datagrams) and provides flow control mechanisms to manage resource consumption.
+
+<Note>
+For consumers that are writing, publishing data on a track consumes resources which are freed as the subscribers receive and acknowledge data. The underlying session will terminate a subscription that exceeds publisher-side resource limits.
+</Note>
+
+## Methods
+
+### setTrackAlias
+
+Associates a numeric track alias with this track subscription.
+
+```cpp
+folly::Expected<folly::Unit, MoQPublishError> setTrackAlias(
+    TrackAlias alias)
+```
+
+<ParamField path="alias" type="TrackAlias" required>
+  The numeric alias to associate with this track. This allows using a shorter identifier instead of the full track namespace/name tuple.
+</ParamField>
+
+<ResponseField name="return" type="folly::Expected<folly::Unit, MoQPublishError>">
+  Returns `folly::Unit` on success, or `MoQPublishError` if the alias is already in use or has already been set for this track.
+</ResponseField>
+
+<Note>
+This method is typically called by publishers in response to SUBSCRIBE requests. It can fail if the alias is already in use or has already been set.
+</Note>
+
+### beginSubgroup
+
+Starts delivering a new subgroup within a specified group.
+
+```cpp
+folly::Expected<std::shared_ptr<SubgroupConsumer>, MoQPublishError>
+beginSubgroup(
+    uint64_t groupID,
+    uint64_t subgroupID,
+    Priority priority,
+    bool containsLastInGroup = false)
+```
+
+<ParamField path="groupID" type="uint64_t" required>
+  The group identifier for this subgroup.
+</ParamField>
+
+<ParamField path="subgroupID" type="uint64_t" required>
+  The subgroup identifier within the group.
+</ParamField>
+
+<ParamField path="priority" type="Priority" required>
+  The priority level for delivering this subgroup's objects.
+</ParamField>
+
+<ParamField path="containsLastInGroup" type="bool" default="false">
+  Indicates whether this subgroup contains the last object in the group.
+</ParamField>
+
+<ResponseField name="return" type="folly::Expected<std::shared_ptr<SubgroupConsumer>, MoQPublishError>">
+  Returns a `SubgroupConsumer` for delivering objects within this subgroup, or `MoQPublishError::BLOCKED` when out of stream credit.
+</ResponseField>
+
+<Info>
+When the consumer is writing to the network, this method can fail with `MoQPublishError::BLOCKED` when out of stream credit. Use `awaitStreamCredit()` to wait for additional credit.
+</Info>
+
+### objectStream
+
+Delivers a single complete object on its own stream.
+
+```cpp
+folly::Expected<folly::Unit, MoQPublishError> objectStream(
+    const ObjectHeader& header,
+    Payload payload,
+    bool lastInGroup = false)
+```
+
+<ParamField path="header" type="const ObjectHeader&" required>
+  The object header containing group ID, subgroup ID, object ID, status, and forwarding preference. The `header.length` must equal the payload length, or be 0 for non-NORMAL status.
+</ParamField>
+
+<ParamField path="payload" type="Payload" required>
+  The complete object payload data.
+</ParamField>
+
+<ParamField path="lastInGroup" type="bool" default="false">
+  Indicates whether this object is the last in its group.
+</ParamField>
+
+<ResponseField name="return" type="folly::Expected<folly::Unit, MoQPublishError>">
+  Returns `folly::Unit` on success, or `MoQPublishError::BLOCKED` when out of stream credit.
+</ResponseField>
+
+<Note>
+This method delivers a single-object or object status subgroup. It can fail with `MoQPublishError::BLOCKED` when out of stream credit.
+</Note>
+
+### datagram
+
+Delivers an object via unreliable datagram.
+
+```cpp
+folly::Expected<folly::Unit, MoQPublishError> datagram(
+    const ObjectHeader& header,
+    Payload payload,
+    bool lastInGroup = false)
+```
+
+<ParamField path="header" type="const ObjectHeader&" required>
+  The object header containing group ID, subgroup ID, object ID, status, and forwarding preference.
+</ParamField>
+
+<ParamField path="payload" type="Payload" required>
+  The object payload data.
+</ParamField>
+
+<ParamField path="lastInGroup" type="bool" default="false">
+  Indicates whether this object is the last in its group.
+</ParamField>
+
+<ResponseField name="return" type="folly::Expected<folly::Unit, MoQPublishError>">
+  Returns `folly::Unit` on success, or `MoQPublishError` on failure.
+</ResponseField>
+
+<Warning>
+Datagrams can be dropped by either the sender or receiver if resources are low. Use this delivery mode only for data that can tolerate loss.
+</Warning>
+
+### publishDone
+
+Informs the consumer that no new subgroups or datagrams will be sent on this track.
+
+```cpp
+folly::Expected<folly::Unit, MoQPublishError> publishDone(
+    PublishDone pubDone)
+```
+
+<ParamField path="pubDone" type="PublishDone" required>
+  Structure containing final status information about the completed publication.
+</ParamField>
+
+<ResponseField name="return" type="folly::Expected<folly::Unit, MoQPublishError>">
+  Returns `folly::Unit` on success, or `MoQPublishError` on failure.
+</ResponseField>
+
+<Info>
+This method signals that the publisher will not open any new subgroups or send any new datagrams for this track. Existing open subgroups can still complete.
+</Info>
+
+### awaitStreamCredit
+
+Waits for additional stream credit to become available.
+
+```cpp
+folly::Expected<folly::SemiFuture<folly::Unit>, MoQPublishError>
+awaitStreamCredit()
+```
+
+<ResponseField name="return" type="folly::Expected<folly::SemiFuture<folly::Unit>, MoQPublishError>">
+  Returns a `SemiFuture` that completes when stream credit becomes available, or `MoQPublishError` if the subscription has been terminated.
+</ResponseField>
+
+<Info>
+Use this method after receiving `MoQPublishError::BLOCKED` from `beginSubgroup()` or `objectStream()` to wait until it's safe to retry the operation.
+</Info>
+
+### setDeliveryCallback
+
+Registers a callback to receive notifications when objects are delivered.
+
+```cpp
+void setDeliveryCallback(std::shared_ptr<DeliveryCallback> callback)
+```
+
+<ParamField path="callback" type="std::shared_ptr<DeliveryCallback>" required>
+  The callback implementation to receive delivery notifications.
+</ParamField>
+
+<Note>
+The default implementation is a no-op. This method is only implemented by the library-provided implementation of `TrackConsumer`. Applications implementing their own `TrackConsumer` can ignore this method.
+</Note>
+
+## Flow Control
+
+The `TrackConsumer` interface provides a subscription-level flow control mechanism:
+
+1. **Stream Credit**: Publishing operations consume stream credit. When credit is exhausted, methods return `MoQPublishError::BLOCKED`.
+
+2. **Backpressure Handling**: 
+   - When `beginSubgroup()` or `objectStream()` returns `BLOCKED`, stop publishing
+   - Call `awaitStreamCredit()` to wait for credit to become available
+   - Resume publishing after the future completes
+
+3. **Resource Limits**: The underlying session will terminate subscriptions that exceed configured resource limits.
+
+## Usage Example
+
+```cpp
+// Publishing to a track consumer
+auto publishToTrack(std::shared_ptr<TrackConsumer> consumer) -> folly::coro::Task<void> {
+  // Set track alias
+  auto aliasResult = consumer->setTrackAlias(TrackAlias{42});
+  if (aliasResult.hasError()) {
+    // Handle error
+    co_return;
+  }
+
+  uint64_t groupId = 0;
+  uint64_t subgroupId = 0;
+  Priority priority{0};
+
+  while (hasMoreData()) {
+    // Begin a new subgroup
+    auto subgroupResult = consumer->beginSubgroup(
+        groupId, subgroupId, priority);
+    
+    if (subgroupResult.hasError()) {
+      if (subgroupResult.error().code == MoQPublishError::BLOCKED) {
+        // Wait for stream credit
+        auto creditResult = consumer->awaitStreamCredit();
+        if (creditResult.hasError()) {
+          co_return;
+        }
+        co_await std::move(creditResult.value());
+        continue; // Retry
+      }
+      co_return;
+    }
+
+    auto subgroup = subgroupResult.value();
+    
+    // Publish objects to the subgroup
+    uint64_t objectId = 0;
+    while (hasMoreObjectsInSubgroup()) {
+      auto payload = getNextPayload();
+      auto result = subgroup->object(objectId++, std::move(payload));
+      if (result.hasError()) {
+        break;
+      }
+    }
+
+    // Close the subgroup
+    subgroup->endOfSubgroup();
+    
+    subgroupId++;
+  }
+
+  // Signal completion
+  consumer->publishDone(PublishDone{});
+}
+```
+
+## See Also
+
+- [SubgroupConsumer](/api/subgroup-consumer) - Interface for delivering objects within a subgroup
+- [FetchConsumer](/api/fetch-consumer) - Similar interface for FETCH requests
+- [MoQSession](/api/moqsession) - Session management and TrackConsumer creation

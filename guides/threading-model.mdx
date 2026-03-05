@@ -1,0 +1,380 @@
+---
+title: Threading Model
+description: Understanding Moxygen's single-threaded session model and multi-threaded patterns
+---
+
+Moxygen uses a carefully designed threading model that prioritizes simplicity and performance while enabling scalable multi-client applications.
+
+## Critical Constraint
+
+<Warning>
+**Each `MoQSession` MUST only be accessed from the thread in which it was created.**
+
+This is the fundamental rule of Moxygen's threading model. Violating this constraint leads to undefined behavior and race conditions.
+</Warning>
+
+### Why This Matters
+
+- **No internal locking**: The session implementation is lock-free for performance
+- **Event-driven operations**: All callbacks run on the session's thread
+- **Coroutine binding**: Async operations are bound to the session's executor
+- **Simplifies reasoning**: Single-threaded access model is easier to understand and debug
+
+## MoQExecutor Interface
+
+All session operations are scheduled through an executor:
+
+```cpp
+class MoQExecutor {
+ public:
+  virtual ~MoQExecutor() = default;
+
+  // Schedule work on this executor's thread
+  virtual void schedule(folly::Function<void()> fn) = 0;
+
+  // Schedule delayed execution
+  virtual void scheduleTimeout(
+      folly::Function<void()> fn,
+      std::chrono::milliseconds timeout) = 0;
+};
+```
+
+### Folly EventBase Integration
+
+```cpp
+#include <moxygen/events/MoQFollyExecutorImpl.h>
+
+// Create executor from EventBase
+folly::EventBase eventBase;
+auto executor = std::make_shared<MoQFollyExecutorImpl>(&eventBase);
+
+// Create session with executor
+auto session = std::make_shared<MoQSession>(webTransport, executor);
+
+// All session operations now run on eventBase's thread
+```
+
+## Event-Driven Flow
+
+MoQSession processes all operations event-driven:
+
+```cpp
+┌──────────────────────────────────────┐
+│        MoQSession (Thread 1)         │
+│                                      │
+│  ┌────────────────────────────────┐ │
+│  │   Control Message Loop         │ │
+│  │   - SUBSCRIBE                  │ │
+│  │   - FETCH                      │ │
+│  │   - ANNOUNCE                   │ │
+│  └────────────────────────────────┘ │
+│                                      │
+│  ┌────────────────────────────────┐ │
+│  │   Unidirectional Read Loops    │ │
+│  │   - Object streams             │ │
+│  │   - Subgroup data              │ │
+│  └────────────────────────────────┘ │
+│                                      │
+│  ┌────────────────────────────────┐ │
+│  │   Datagram Handler             │ │
+│  │   - onDatagram()               │ │
+│  └────────────────────────────────┘ │
+│                                      │
+│  ┌────────────────────────────────┐ │
+│  │   Application Callbacks        │ │
+│  │   - subscribe()                │ │
+│  │   - onObject()                 │ │
+│  └────────────────────────────────┘ │
+└──────────────────────────────────────┘
+```
+
+### Control Loop
+
+```cpp
+// Runs continuously on the session's thread
+folly::coro::Task<void> MoQSession::controlReadLoop() {
+  while (reading_) {
+    // Read control message
+    auto frame = co_await readFrame();
+
+    // Process on this thread
+    switch (frame.type) {
+      case FrameType::SUBSCRIBE:
+        processSubscribe(frame);
+        break;
+      case FrameType::FETCH:
+        processFetch(frame);
+        break;
+      // ... other control messages
+    }
+  }
+}
+```
+
+## Multi-Threaded Server Pattern
+
+### Worker Thread Architecture
+
+`MoQServer` uses multiple worker threads, with each session bound to one:
+
+```cpp
+┌─────────────────────────────────────────────────┐
+│              MoQServer                          │
+│                                                 │
+│  ┌──────────────┐  ┌──────────────┐           │
+│  │  Worker 1    │  │  Worker 2    │  ...      │
+│  │  EventBase 1 │  │  EventBase 2 │           │
+│  │              │  │              │           │
+│  │  ┌────────┐  │  │  ┌────────┐  │           │
+│  │  │Session1│  │  │  │Session3│  │           │
+│  │  ├────────┤  │  │  ├────────┤  │           │
+│  │  │Session2│  │  │  │Session4│  │           │
+│  │  └────────┘  │  │  └────────┘  │           │
+│  └──────────────┘  └──────────────┘           │
+└─────────────────────────────────────────────────┘
+```
+
+### Server Implementation
+
+```cpp
+class MoQDateServer : public MoQServer {
+ public:
+  MoQDateServer(..., std::shared_ptr<DatePublisher> publisher)
+      : MoQServer(...),
+        publisher_(std::move(publisher)) {}
+
+  // Called on worker thread when new connection arrives
+  void onNewSession(std::shared_ptr<MoQSession> clientSession) override {
+    // This runs on the worker thread that will own this session
+    clientSession->setPublishHandler(publisher_);
+  }
+
+ private:
+  std::shared_ptr<DatePublisher> publisher_;
+};
+
+int main() {
+  auto server = std::make_shared<MoQDateServer>(...);
+  server->start(addr);
+
+  // Server creates multiple worker threads
+  // Each worker has its own EventBase
+  std::vector<folly::EventBase*> evbs = server->getWorkerEvbs();
+  XLOG(INFO) << "Server running with " << evbs.size() << " workers";
+
+  // Main thread runs event loop
+  folly::EventBase evb;
+  evb.loopForever();
+}
+```
+
+## Thread-Safe Patterns
+
+### Shared Publisher (Thread-Safe)
+
+If a publisher handles multiple sessions across threads, use synchronization:
+
+```cpp
+class ThreadSafePublisher : public Publisher {
+ public:
+  folly::coro::Task<SubscribeResult> subscribe(
+      SubscribeRequest subReq,
+      std::shared_ptr<TrackConsumer> consumer) override {
+    // Get the session and its executor
+    auto session = MoQSession::getRequestSession();
+    auto executor = session->getExecutor();
+
+    // Protect shared state
+    {
+      std::lock_guard<std::mutex> lock(subscribersMutex_);
+      subscribers_.push_back({session, consumer});
+    }
+
+    // Return on the caller's thread (session's thread)
+    co_return createSubscriptionHandle(...);
+  }
+
+  // Publishing must be dispatched to each session's thread
+  void publishObject(uint64_t group, uint64_t obj, Payload payload) {
+    std::lock_guard<std::mutex> lock(subscribersMutex_);
+
+    for (auto& [session, consumer] : subscribers_) {
+      // Clone payload for each subscriber
+      auto payloadClone = payload->clone();
+
+      // Schedule on that session's thread
+      session->getExecutor()->schedule([consumer, payloadClone = std::move(payloadClone), group, obj]() {
+        consumer->objectStream(ObjectHeader{group, 0, obj, ...}, std::move(payloadClone));
+      });
+    }
+  }
+
+ private:
+  std::mutex subscribersMutex_;
+  std::vector<std::pair<std::shared_ptr<MoQSession>, std::shared_ptr<TrackConsumer>>> subscribers_;
+};
+```
+
+### Using MoQForwarder
+
+`MoQForwarder` handles thread-safety internally:
+
+```cpp
+class DatePublisher : public Publisher {
+ public:
+  DatePublisher() : forwarder_(trackName) {}
+
+  folly::coro::Task<SubscribeResult> subscribe(
+      SubscribeRequest subReq,
+      std::shared_ptr<TrackConsumer> consumer) override {
+    auto session = MoQSession::getRequestSession();
+
+    // Forwarder handles thread-safe subscriber management
+    auto subscriber = forwarder_.addSubscriber(
+        std::move(session), subReq, std::move(consumer));
+
+    co_return subscriber;
+  }
+
+  // Publishing is thread-safe
+  void publishDate(uint64_t group, uint64_t second) {
+    // Forwarder dispatches to each subscriber's thread
+    auto subgroupPublisher = forwarder_.beginSubgroup(group, 0, 0).value();
+    subgroupPublisher->object(second, payload, extensions);
+  }
+
+ private:
+  MoQForwarder forwarder_;
+};
+```
+
+## Coroutine Scheduling
+
+Ensure coroutines run on the correct thread:
+
+```cpp
+// Start a task on the session's thread
+co_withExecutor(
+    session->getExecutor(),
+    myTask())
+    .start();
+
+// Schedule work on a specific executor
+auto task = myTask().scheduleOn(executor.get());
+task.start();
+```
+
+### Example: Publisher Loop
+
+```cpp
+folly::coro::Task<void> DatePublisher::subscribe(...) {
+  auto session = MoQSession::getRequestSession();
+
+  // Start publish loop on session's executor
+  if (!loopRunning_) {
+    loopRunning_ = true;
+    co_withExecutor(
+        session->getExecutor(),
+        publishDateLoop())
+        .start();
+  }
+
+  co_return subscriber;
+}
+```
+
+## Common Pitfalls
+
+<Warning>
+**Pitfall 1: Accessing session from wrong thread**
+
+```cpp
+// WRONG: Direct access from another thread
+std::thread([session]() {
+  session->subscribe(...); // Race condition!
+}).detach();
+
+// CORRECT: Schedule on session's thread
+std::thread([session]() {
+  session->getExecutor()->schedule([session]() {
+    session->subscribe(...);
+  });
+}).detach();
+```
+</Warning>
+
+<Warning>
+**Pitfall 2: Capturing session in lambda without care**
+
+```cpp
+// WRONG: Session may be destroyed
+std::thread([session]() {
+  sleep(5);
+  session->getExecutor()->schedule([session]() { /* ... */ });
+}).detach();
+
+// CORRECT: Use weak_ptr
+std::thread([weakSession = std::weak_ptr(session)]() {
+  sleep(5);
+  if (auto session = weakSession.lock()) {
+    session->getExecutor()->schedule([session]() { /* ... */ });
+  }
+}).detach();
+```
+</Warning>
+
+<Warning>
+**Pitfall 3: Forgetting to clone payloads**
+
+```cpp
+// WRONG: Multiple consumers sharing same buffer
+for (auto& consumer : consumers) {
+  consumer->objectStream(header, payload); // payload consumed!
+}
+
+// CORRECT: Clone for each consumer
+for (auto& consumer : consumers) {
+  auto payloadClone = payload->clone();
+  consumer->objectStream(header, std::move(payloadClone));
+}
+```
+</Warning>
+
+## Performance Implications
+
+### Benefits
+
+✅ **No locking overhead** within a session
+✅ **Cache-friendly** - session data stays on one CPU
+✅ **Simple debugging** - no race conditions within session
+✅ **Natural scaling** - multiple sessions = multiple cores
+
+### Trade-offs
+
+⚠️ **Inter-session communication** requires thread-safe mechanisms
+⚠️ **Load balancing** needed to distribute sessions evenly
+⚠️ **Shared state** requires explicit synchronization
+
+## Best Practices
+
+<Note>
+**Session per Thread**: Design your application so each session lives entirely on one thread.
+</Note>
+
+<Note>
+**Use Executors**: Always schedule work through the session's executor, never access directly.
+</Note>
+
+<Note>
+**Leverage MoQForwarder**: For fan-out scenarios, use the built-in forwarder which handles thread safety.
+</Note>
+
+<Note>
+**Clone Payloads**: When sending to multiple consumers, clone payloads to avoid use-after-move bugs.
+</Note>
+
+## Next Steps
+
+- Review [Building a Publisher](/guides/building-publisher) with threading in mind
+- Understand [Setting Up a Relay](/guides/setting-up-relay) multi-threaded architecture
+- Explore [Media Streaming](/guides/media-streaming) with concurrent encoders

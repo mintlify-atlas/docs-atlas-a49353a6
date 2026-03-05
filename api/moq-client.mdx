@@ -1,0 +1,299 @@
+---
+title: MoQClient
+description: Client connection class for establishing MOQT sessions
+---
+
+## Overview
+
+`MoQClient` is the primary client class for establishing MOQT connections using native QUIC transport. It extends `MoQClientBase` and provides methods to connect to MOQT servers and create `MoQSession` instances.
+
+**Header:** `moxygen/MoQClient.h`
+
+**Namespace:** `moxygen`
+
+## Class Definition
+
+```cpp
+class MoQClient : public MoQClientBase {
+ public:
+  MoQClient(
+      std::shared_ptr<MoQExecutor> exec,
+      proxygen::URL url,
+      std::shared_ptr<fizz::CertificateVerifier> verifier = nullptr);
+
+  MoQClient(
+      std::shared_ptr<MoQExecutor> exec,
+      proxygen::URL url,
+      SessionFactory sessionFactory,
+      std::shared_ptr<fizz::CertificateVerifier> verifier = nullptr);
+};
+```
+
+## Constructors
+
+### Basic Constructor
+
+```cpp
+MoQClient(
+    std::shared_ptr<MoQExecutor> exec,
+    proxygen::URL url,
+    std::shared_ptr<fizz::CertificateVerifier> verifier = nullptr);
+```
+
+Creates a client that connects to a MOQT server using native QUIC transport.
+
+**Parameters:**
+- `exec` - Executor for event-driven operations (typically `MoQFollyExecutorImpl`)
+- `url` - Target server URL (e.g., `https://example.com:4433/moq`)
+- `verifier` - Optional TLS certificate verifier (default: standard verification)
+
+### Constructor with Session Factory
+
+```cpp
+MoQClient(
+    std::shared_ptr<MoQExecutor> exec,
+    proxygen::URL url,
+    SessionFactory sessionFactory,
+    std::shared_ptr<fizz::CertificateVerifier> verifier = nullptr);
+```
+
+Creates a client with a custom session factory for advanced use cases.
+
+**Parameters:**
+- `exec` - Executor for event-driven operations
+- `url` - Target server URL
+- `sessionFactory` - Custom factory function for creating `MoQSession` instances
+- `verifier` - Optional TLS certificate verifier
+
+## Key Methods
+
+### setupMoQSession
+
+```cpp
+folly::coro::Task<void> setupMoQSession(
+    std::chrono::milliseconds connect_timeout,
+    std::chrono::milliseconds transaction_timeout,
+    std::shared_ptr<Publisher> publishHandler,
+    std::shared_ptr<Subscriber> subscribeHandler,
+    const quic::TransportSettings& transportSettings,
+    const std::vector<std::string>& alpns = {});
+```
+
+Establishes a connection and completes the MOQT handshake.
+
+**Parameters:**
+- `connect_timeout` - Connection timeout in milliseconds
+- `transaction_timeout` - Transaction timeout in milliseconds
+- `publishHandler` - Handler for incoming publish requests (can be nullptr)
+- `subscribeHandler` - Handler for incoming subscribe requests (can be nullptr)
+- `transportSettings` - QUIC transport settings
+- `alpns` - Application-layer protocol negotiation strings (optional)
+
+**Returns:** Coroutine that completes when the session is established
+
+### getConnectionFlowControl
+
+```cpp
+quic::Expected<quic::QuicSocketLite::FlowControlState, quic::LocalErrorCode>
+getConnectionFlowControl() const;
+```
+
+Retrieves the current connection-level flow control state.
+
+**Returns:** Flow control state or error if connection is closed
+
+### getTransportInfo
+
+```cpp
+std::optional<quic::TransportInfo> getTransportInfo() const;
+```
+
+Retrieves transport information for the underlying QUIC connection.
+
+**Returns:** Transport info if available, otherwise `std::nullopt`
+
+## Usage Example
+
+### Basic Client Connection
+
+```cpp
+#include <moxygen/MoQClient.h>
+#include <moxygen/events/MoQFollyExecutorImpl.h>
+#include <proxygen/lib/utils/URL.h>
+
+using namespace moxygen;
+
+// Create executor
+auto evb = std::make_shared<folly::EventBase>();
+auto executor = std::make_shared<MoQFollyExecutorImpl>(evb);
+
+// Create client
+proxygen::URL url("https://relay.example.com:4433/moq");
+auto client = std::make_unique<MoQClient>(executor, url);
+
+// Setup transport settings
+quic::TransportSettings transportSettings;
+transportSettings.defaultCongestionController = 
+    quic::CongestionControlType::Copa;
+
+// Connect and setup session
+co_await client->setupMoQSession(
+    std::chrono::milliseconds(1000),  // connect timeout
+    std::chrono::milliseconds(120000), // transaction timeout
+    nullptr,  // no publish handler
+    nullptr,  // no subscribe handler
+    transportSettings);
+
+// Access the session
+auto session = client->moqSession_;
+```
+
+### Client with Subscribe Handler
+
+```cpp
+class MySubscriber : public Subscriber {
+ public:
+  folly::coro::Task<PublishResult> publish(
+      PublishRequest pubReq,
+      std::shared_ptr<SubscriptionHandle> handle) override {
+    XLOG(INFO) << "Received publish for track: "
+               << pubReq.fullTrackName.trackName;
+    // Return consumer to receive objects
+    auto consumer = std::make_shared<MyTrackConsumer>();
+    co_return PublishOk{
+      .requestID = pubReq.requestID,
+      .expires = std::chrono::milliseconds(0),
+      .consumer = consumer
+    };
+  }
+};
+
+// Create client with handler
+auto subscriber = std::make_shared<MySubscriber>();
+co_await client->setupMoQSession(
+    std::chrono::milliseconds(1000),
+    std::chrono::milliseconds(120000),
+    nullptr,     // no publish handler
+    subscriber,  // handle incoming publishes
+    transportSettings);
+```
+
+### Insecure Connection (Development Only)
+
+```cpp
+#include <moxygen/util/InsecureVerifierDangerousDoNotUseInProduction.h>
+
+// WARNING: Only for testing/development
+auto insecureVerifier = 
+    std::make_shared<InsecureVerifierDangerousDoNotUseInProduction>();
+
+auto client = std::make_unique<MoQClient>(
+    executor,
+    url,
+    insecureVerifier  // Skip certificate verification
+);
+```
+
+## Transport Configuration
+
+### QUIC Transport Settings
+
+```cpp
+quic::TransportSettings transportSettings;
+
+// Congestion control
+transportSettings.defaultCongestionController = 
+    quic::CongestionControlType::Copa;
+transportSettings.copaDeltaParam = 0.05;
+
+// Flow control windows
+transportSettings.advertisedInitialConnectionFlowControlWindow = 
+    1024 * 1024; // 1 MB
+transportSettings.advertisedInitialBidiLocalStreamFlowControlWindow = 
+    1024 * 1024;
+transportSettings.advertisedInitialUniStreamFlowControlWindow = 
+    1024 * 1024;
+
+// Pacing
+transportSettings.pacingEnabled = true;
+transportSettings.maxCwndInMss = quic::kLargeMaxCwndInMss;
+
+// Batching
+transportSettings.batchingMode = 
+    quic::QuicBatchingMode::BATCHING_MODE_GSO;
+transportSettings.maxBatchSize = 48;
+```
+
+## Error Handling
+
+```cpp
+try {
+  co_await client->setupMoQSession(
+      std::chrono::milliseconds(1000),
+      std::chrono::milliseconds(120000),
+      nullptr,
+      nullptr,
+      transportSettings);
+  
+  if (!client->moqSession_) {
+    XLOG(ERR) << "Failed to create session";
+    co_return;
+  }
+  
+  // Session is ready
+  auto session = client->moqSession_;
+  
+} catch (const std::exception& ex) {
+  XLOG(ERR) << "Connection failed: " << ex.what();
+}
+```
+
+## SSL/TLS Configuration
+
+### Custom Certificate Verifier
+
+```cpp
+#include <fizz/protocol/CertificateVerifier.h>
+
+class MyVerifier : public fizz::CertificateVerifier {
+ public:
+  std::shared_ptr<const folly::AsyncTransportCertificate>
+  verify(const std::vector<std::shared_ptr<const fizz::PeerCert>>& certs) 
+      const override {
+    // Custom verification logic
+    return nullptr;
+  }
+};
+
+auto verifier = std::make_shared<MyVerifier>();
+auto client = std::make_unique<MoQClient>(executor, url, verifier);
+```
+
+## Threading Constraints
+
+<Warning>
+  Each `MoQClient` and its associated `MoQSession` MUST only be accessed from 
+  the thread associated with its executor's event base.
+</Warning>
+
+The client and session are not thread-safe. All operations must be performed on 
+the executor's event loop thread. Use `folly::via()` or `co_withExecutor()` to 
+ensure operations run on the correct thread.
+
+```cpp
+// Ensure operation runs on correct thread
+co_withExecutor(
+    executor.get(),
+    [&]() -> folly::coro::Task<void> {
+      co_await client->setupMoQSession(...);
+    }()
+).start();
+```
+
+## See Also
+
+- [MoQWebTransportClient](/api/moq-web-transport-client) - HTTP/3 WebTransport client
+- [MoQSession](/api/moq-session) - Session management
+- [Publisher](/api/publisher) - Publishing interface
+- [Subscriber](/api/subscriber) - Subscribing interface
+- [MoQExecutor](/api/moq-executor) - Executor abstraction

@@ -1,0 +1,376 @@
+---
+title: Building a Subscriber
+description: Step-by-step guide to creating a MoQ subscriber application
+---
+
+This guide demonstrates how to build a MOQT subscriber using the Moxygen library. We'll use the text client sample as a reference to show how to connect, subscribe, and receive data.
+
+## Overview
+
+A MoQ subscriber:
+- Connects to a publisher or relay using `MoQClient` or `MoQWebTransportClient`
+- Implements the `TrackConsumer` interface to receive objects
+- Subscribes to tracks and handles incoming data
+- Manages subscription lifecycle (subscribe, unsubscribe, fetch)
+
+## Prerequisites
+
+```cpp
+#include <moxygen/MoQClient.h>
+#include <moxygen/MoQWebTransportClient.h>
+#include <moxygen/ObjectReceiver.h>
+```
+
+<Steps>
+
+### Step 1: Implement the Object Handler
+
+Create a callback to process received objects:
+
+```cpp
+class TextHandler : public ObjectReceiverCallback {
+ public:
+  explicit TextHandler(bool fetch) : fetch_(fetch) {}
+
+  // Called when an object is received
+  FlowControlState onObject(
+      std::optional<TrackAlias> trackAlias,
+      const ObjectHeader& header,
+      Payload payload) override {
+    // Process object extensions
+    const auto& mutable_exts = header.extensions.getMutableExtensions();
+    for (const auto& ext : mutable_exts) {
+      if (ext.type & 0x1) {
+        // Data extension
+        std::cout << "data extension=" << ext.arrayValue << std::endl;
+      } else {
+        // Integer extension
+        std::cout << "int extension=" << ext.intValue << std::endl;
+      }
+    }
+
+    // Process payload
+    if (payload) {
+      std::cout << payload->moveToFbString() << std::endl;
+    }
+
+    return FlowControlState::UNBLOCKED;
+  }
+
+  // Called for object status (end-of-group, etc.)
+  void onObjectStatus(
+      std::optional<TrackAlias> trackAlias,
+      const ObjectHeader& objHeader) override {
+    std::cout << "ObjectStatus=" << uint32_t(objHeader.status) << std::endl;
+  }
+
+  // Called when stream ends (for fetch)
+  void onEndOfStream() override {
+    if (fetch_) {
+      std::cout << __func__ << std::endl;
+      baton.post();
+    }
+  }
+
+  // Called on stream error
+  void onError(ResetStreamErrorCode error) override {
+    std::cout << "Stream Error=" << folly::to_underlying(error) << std::endl;
+  }
+
+  folly::coro::Baton baton;
+
+ private:
+  bool fetch_{false};
+};
+```
+
+### Step 2: Create the Client
+
+Set up a subscriber client with connection parameters:
+
+```cpp
+class MoQTextClient : public Subscriber,
+                      public std::enable_shared_from_this<MoQTextClient> {
+ public:
+  MoQTextClient(
+      std::shared_ptr<MoQFollyExecutorImpl> evb,
+      proxygen::URL url,
+      FullTrackName ftn,
+      std::shared_ptr<fizz::CertificateVerifier> verifier = nullptr)
+      : moqClient_(
+            FLAGS_quic_transport
+                ? std::make_unique<MoQClient>(
+                      evb,
+                      std::move(url),
+                      MoQRelaySession::createRelaySessionFactory(),
+                      verifier)
+                : std::make_unique<MoQWebTransportClient>(
+                      evb,
+                      std::move(url),
+                      MoQRelaySession::createRelaySessionFactory(),
+                      verifier)),
+        fullTrackName_(std::move(ftn)) {}
+
+ private:
+  MoQRelayClient moqClient_;
+  FullTrackName fullTrackName_;
+  std::shared_ptr<ObjectReceiver> subTextReceiver_;
+  std::shared_ptr<Publisher::SubscriptionHandle> subscription_;
+};
+```
+
+### Step 3: Connect and Setup Session
+
+Establish connection and perform MoQ handshake:
+
+```cpp
+folly::coro::Task<void> MoQTextClient::run(SubscribeRequest sub) {
+  XLOG(INFO) << __func__;
+  try {
+    // Get supported protocol versions
+    auto alpns = getMoqtProtocols(FLAGS_versions, true);
+
+    // Setup MoQ session
+    co_await moqClient_.setup(
+        /*publisher=*/nullptr,
+        /*subscriber=*/shared_from_this(),
+        std::chrono::milliseconds(FLAGS_connect_timeout),
+        std::chrono::seconds(FLAGS_transaction_timeout),
+        quic::TransportSettings(),
+        alpns);
+
+    XLOG(INFO) << "Connected to " << FLAGS_connect_url;
+    // Continue with subscription...
+  } catch (const std::exception& ex) {
+    XLOG(ERR) << folly::exceptionStr(ex);
+    co_return;
+  }
+}
+```
+
+### Step 4: Subscribe to Tracks
+
+Subscribe to receive data from a track:
+
+```cpp
+// Create object receiver with handler
+subTextReceiver_ = std::make_shared<ObjectReceiver>(
+    ObjectReceiver::SUBSCRIBE,
+    subTextHandler_);
+
+// Build subscribe request
+SubscribeRequest sub = SubscribeRequest::make(
+    fullTrackName_,
+    0, // request ID
+    GroupOrder::OldestFirst,
+    true, // forward
+    LocationType::LargestObject, // start from latest
+    std::nullopt, // start location
+    0, // end group
+    params);
+
+// Send subscribe request
+auto track = co_await moqClient_.getSession()->subscribe(
+    sub, subTextReceiver_);
+
+if (track.hasValue()) {
+  subscription_ = std::move(track.value());
+  auto requestID = subscription_->subscribeOk().requestID;
+  auto largest = subscription_->subscribeOk().largest;
+
+  XLOG(INFO) << "Subscribed! requestID=" << requestID;
+  if (largest) {
+    XLOG(INFO) << "Largest={" << largest->group << ", "
+               << largest->object << "}";
+  }
+} else {
+  XLOG(ERR) << "SubscribeError id=" << track.error().requestID
+            << " code=" << folly::to_underlying(track.error().errorCode)
+            << " reason=" << track.error().reasonPhrase;
+}
+```
+
+### Step 5: Handle Subscription Locations
+
+Control where to start receiving data:
+
+<CodeGroup>
+
+```cpp Latest Object
+SubscribeRequest sub = SubscribeRequest::make(
+    fullTrackName,
+    0,
+    GroupOrder::OldestFirst,
+    true,
+    LocationType::LargestObject, // Start from latest
+    std::nullopt,
+    0,
+    params);
+```
+
+```cpp Absolute Start
+SubscribeRequest sub = SubscribeRequest::make(
+    fullTrackName,
+    0,
+    GroupOrder::OldestFirst,
+    true,
+    LocationType::AbsoluteStart,
+    AbsoluteLocation{groupId, objectId}, // Start from specific location
+    0,
+    params);
+```
+
+```cpp Absolute Range
+SubscribeRequest sub = SubscribeRequest::make(
+    fullTrackName,
+    0,
+    GroupOrder::OldestFirst,
+    true,
+    LocationType::AbsoluteRange,
+    AbsoluteLocation{startGroup, startObject},
+    endGroup, // End at this group
+    params);
+```
+
+</CodeGroup>
+
+### Step 6: Fetch Historical Data
+
+Use FETCH for historical data retrieval:
+
+```cpp
+// Create fetch receiver
+fetchTextReceiver_ = std::make_shared<ObjectReceiver>(
+    ObjectReceiver::FETCH,
+    fetchTextHandler_);
+
+// Build fetch request
+Fetch fetchReq(
+    RequestID(0),
+    fullTrackName,
+    AbsoluteLocation{startGroup, startObject}, // start
+    AbsoluteLocation{endGroup + 1, 0}, // end (exclusive)
+    priority,
+    groupOrder);
+
+// Send fetch request
+auto fetchTrack = co_await moqClient_.getSession()->fetch(
+    fetchReq,
+    fetchTextReceiver_);
+
+if (fetchTrack.hasError()) {
+  XLOG(ERR) << "Fetch failed err="
+            << folly::to_underlying(fetchTrack.error().errorCode)
+            << " reason=" << fetchTrack.error().reasonPhrase;
+} else {
+  XLOG(INFO) << "Fetch started";
+}
+```
+
+### Step 7: Main Application Setup
+
+Put it all together:
+
+```cpp
+int main(int argc, char* argv[]) {
+  folly::Init init(&argc, &argv, false);
+  folly::EventBase eventBase;
+
+  // Parse URL
+  proxygen::URL url(FLAGS_connect_url);
+  if (!url.isValid() || !url.hasHost()) {
+    XLOG(ERR) << "Invalid url: " << FLAGS_connect_url;
+    return 1;
+  }
+
+  // Create executor
+  std::shared_ptr<MoQFollyExecutorImpl> moqEvb =
+      std::make_shared<MoQFollyExecutorImpl>(&eventBase);
+
+  // Setup certificate verifier
+  std::shared_ptr<fizz::CertificateVerifier> verifier = nullptr;
+  if (FLAGS_insecure) {
+    verifier = std::make_shared<
+        moxygen::test::InsecureVerifierDangerousDoNotUseInProduction>();
+  }
+
+  // Create client
+  TrackNamespace ns = TrackNamespace(
+      FLAGS_track_namespace,
+      FLAGS_track_namespace_delimiter);
+  auto textClient = std::make_shared<MoQTextClient>(
+      moqEvb,
+      std::move(url),
+      moxygen::FullTrackName({ns, FLAGS_track_name}),
+      verifier);
+
+  // Setup signal handler
+  class SigHandler : public folly::AsyncSignalHandler {
+   public:
+    explicit SigHandler(folly::EventBase* evb, std::function<void(int)> fn)
+        : folly::AsyncSignalHandler(evb), fn_(std::move(fn)) {
+      registerSignalHandler(SIGTERM);
+      registerSignalHandler(SIGINT);
+    }
+    void signalReceived(int signum) noexcept override {
+      fn_(signum);
+    }
+   private:
+    std::function<void(int)> fn_;
+  };
+
+  SigHandler handler(&eventBase, [&textClient](int) {
+    textClient->stop();
+  });
+
+  // Run client
+  auto subParams = flags2params();
+  co_withExecutor(
+      &eventBase,
+      textClient->run(SubscribeRequest::make(
+          moxygen::FullTrackName({std::move(ns), FLAGS_track_name}),
+          0,
+          GroupOrder::OldestFirst,
+          FLAGS_forward,
+          subParams.locType,
+          subParams.start,
+          subParams.endGroup,
+          {})))
+      .start()
+      .via(&eventBase);
+
+  eventBase.loop();
+  return 0;
+}
+```
+
+</Steps>
+
+## Complete Example
+
+See the full text client implementation in `moxygen/samples/text-client/MoQTextClient.cpp` for a working example that demonstrates:
+- Connecting with both HTTP/3 WebTransport and raw QUIC
+- SUBSCRIBE with various location types
+- FETCH for historical data
+- Joining fetch (absolute and relative)
+- Handling subscription updates and unsubscribe
+
+## Key Concepts
+
+<Note>
+**ObjectReceiver**: Wraps your callback to handle the object reception protocol and state management.
+</Note>
+
+<Note>
+**Location Types**: Control where subscription starts - latest object, absolute position, or a range.
+</Note>
+
+<Warning>
+Use FETCH for historical data and SUBSCRIBE for live streaming. Combining both requires careful range management.
+</Warning>
+
+## Next Steps
+
+- Learn about [Building a Publisher](/guides/building-publisher)
+- Explore [Media Streaming](/guides/media-streaming) for video/audio
+- Understand [Setting Up a Relay](/guides/setting-up-relay)

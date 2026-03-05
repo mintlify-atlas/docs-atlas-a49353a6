@@ -1,0 +1,419 @@
+---
+title: Publisher & Subscriber Interfaces
+description: Understanding Moxygen's symmetric API design for building composable MOQT applications
+---
+
+## Symmetric Interface Design
+
+Moxygen's `Publisher` and `Subscriber` interfaces are **symmetric**, meaning they mirror each other's structure. This design enables powerful composition patterns where components can be easily chained together.
+
+### The Symmetry
+
+```cpp
+// Subscriber calls methods on Publisher
+Subscriber → Publisher::subscribe()      → returns SubscriptionHandle
+Subscriber → Publisher::fetch()          → returns FetchHandle
+Subscriber → Publisher::trackStatus()    → returns TrackStatusOk
+
+// Publisher calls methods on Subscriber
+Publisher → Subscriber::publishNamespace() → returns PublishNamespaceHandle
+Publisher → Subscriber::publish()          → returns TrackConsumer
+```
+
+**Key Insight**: Both `MoQSession` and application components implement these interfaces, creating a uniform API that works the same whether communicating with a remote peer or a local component.
+
+<Info>
+The symmetric design means you can chain components together: `Publisher → Filter → Relay → Cache → Subscriber`. Each component implements both interfaces to receive from upstream and serve to downstream.
+</Info>
+
+## Publisher Interface
+
+The `Publisher` interface represents a component that can respond to subscription requests.
+
+### Core Methods
+
+Defined in `moxygen/Publisher.h`:
+
+```cpp
+class Publisher {
+ public:
+  // Respond to SUBSCRIBE requests
+  virtual folly::coro::Task<SubscribeResult> subscribe(
+      SubscribeRequest sub,
+      std::shared_ptr<TrackConsumer> callback);
+
+  // Respond to FETCH requests for historical data
+  virtual folly::coro::Task<FetchResult> fetch(
+      Fetch fetch,
+      std::shared_ptr<FetchConsumer> fetchCallback);
+
+  // Respond to TRACK_STATUS_REQUEST messages
+  virtual folly::coro::Task<TrackStatusResult> trackStatus(
+      const TrackStatus trackStatus);
+
+  // Respond to SUBSCRIBE_NAMESPACE requests (relay-specific)
+  virtual folly::coro::Task<SubscribeNamespaceResult> subscribeNamespace(
+      SubscribeNamespace subAnn,
+      std::shared_ptr<NamespacePublishHandle> namespacePublishHandle);
+
+  // Handle graceful shutdown
+  virtual void goaway(Goaway goaway);
+};
+```
+
+### SubscriptionHandle Lifecycle
+
+Successful `subscribe()` calls return a `SubscriptionHandle`:
+
+```cpp
+class SubscriptionHandle {
+ public:
+  // Terminate the subscription
+  virtual void unsubscribe() = 0;
+
+  // Update subscription parameters (range, priority, forward preference)
+  virtual folly::coro::Task<RequestUpdateResult> requestUpdate(
+      RequestUpdate reqUpdate) = 0;
+
+  // Access the SUBSCRIBE_OK response
+  const SubscribeOk& subscribeOk() const;
+};
+```
+
+**Example Usage:**
+
+```cpp
+// Subscribe to a track
+auto result = co_await session->subscribe(
+    SubscribeRequest{...},
+    trackConsumer
+);
+
+if (result.hasValue()) {
+    auto handle = result.value();
+    
+    // Later: update subscription to change range
+    RequestUpdate update;
+    update.startLocation = SubscribeLocation::Absolute(100, 0);
+    auto updateResult = co_await handle->requestUpdate(update);
+    
+    // Later: unsubscribe
+    handle->unsubscribe();
+}
+```
+
+### FetchHandle Lifecycle
+
+Successful `fetch()` calls return a `FetchHandle`:
+
+```cpp
+class FetchHandle {
+ public:
+  // Cancel the fetch
+  virtual void fetchCancel() = 0;
+
+  // Update fetch parameters
+  virtual folly::coro::Task<RequestUpdateResult> requestUpdate(
+      RequestUpdate reqUpdate) = 0;
+
+  // Access the FETCH_OK response
+  const FetchOk& fetchOk() const;
+};
+```
+
+### Implementing a Custom Publisher
+
+```cpp
+class MyPublisher : public Publisher {
+ public:
+  folly::coro::Task<SubscribeResult> subscribe(
+      SubscribeRequest sub,
+      std::shared_ptr<TrackConsumer> consumer) override {
+    
+    // Validate subscription request
+    if (!isTrackAvailable(sub.fullTrackName)) {
+      co_return folly::makeUnexpected(
+          SubscribeError{
+              sub.requestID,
+              SubscribeErrorCode::TRACK_DOES_NOT_EXIST,
+              "Track not found"
+          }
+      );
+    }
+    
+    // Create subscription handle
+    auto handle = std::make_shared<MySubscriptionHandle>(
+        sub.fullTrackName,
+        consumer
+    );
+    
+    // Start publishing data to consumer
+    startPublishing(handle);
+    
+    // Return success with handle
+    co_return handle;
+  }
+};
+```
+
+## Subscriber Interface
+
+The `Subscriber` interface represents a component that can receive track namespace publishes and handle publish requests.
+
+### Core Methods
+
+Defined in `moxygen/Subscriber.h`:
+
+```cpp
+class Subscriber {
+ public:
+  // Publish availability of a track namespace
+  virtual folly::coro::Task<PublishNamespaceResult> publishNamespace(
+      PublishNamespace ann,
+      std::shared_ptr<PublishNamespaceCallback> callback);
+
+  // Handle incoming PUBLISH requests from peers
+  virtual PublishResult publish(
+      PublishRequest pub,
+      std::shared_ptr<SubscriptionHandle> handle);
+
+  // Handle graceful shutdown
+  virtual void goaway(Goaway goaway);
+};
+```
+
+### PublishNamespaceHandle Lifecycle
+
+Successful `publishNamespace()` calls return a `PublishNamespaceHandle`:
+
+```cpp
+class PublishNamespaceHandle {
+ public:
+  // Signal namespace is no longer published
+  virtual void publishNamespaceDone() = 0;
+
+  // Update namespace parameters
+  virtual folly::coro::Task<RequestUpdateResult> requestUpdate(
+      RequestUpdate reqUpdate) = 0;
+
+  // Access the PUBLISH_NAMESPACE_OK response
+  const PublishNamespaceOk& publishNamespaceOk() const;
+};
+```
+
+### Synchronous PUBLISH API
+
+The `publish()` method uses a **synchronous API** to enable immediate data publishing:
+
+```cpp
+struct PublishConsumerAndReplyTask {
+  std::shared_ptr<TrackConsumer> consumer;  // Use immediately
+  folly::coro::Task<folly::Expected<PublishOk, PublishError>> reply;  // Await async
+};
+```
+
+**Example Usage:**
+
+```cpp
+// Publisher calls publish on subscriber (session)
+PublishRequest pub;
+pub.fullTrackName = {{"conference-123", "video"}, "alice"};
+pub.forward = true;
+
+auto result = session->publish(pub);
+if (result.hasValue()) {
+    auto [consumer, replyTask] = std::move(result.value());
+    
+    // Start publishing data immediately (don't wait for PUBLISH_OK)
+    auto subgroup = consumer->beginSubgroup(0, 0, 128).value();
+    subgroup->object(0, payload);
+    
+    // Await PUBLISH_OK in background
+    auto reply = co_await std::move(replyTask);
+    if (reply.hasError()) {
+        XLOG(ERR) << "Publish rejected: " << reply.error().reasonPhrase;
+    }
+}
+```
+
+<Info>
+The synchronous PUBLISH design reduces latency by allowing publishers to start sending data before receiving PUBLISH_OK from the peer.
+</Info>
+
+### Implementing a Custom Subscriber
+
+```cpp
+class MySubscriber : public Subscriber {
+ public:
+  PublishResult publish(
+      PublishRequest pub,
+      std::shared_ptr<SubscriptionHandle> handle) override {
+    
+    // Validate publish request
+    if (!isAuthorized(pub.fullTrackName)) {
+      return folly::makeUnexpected(
+          PublishError{
+              pub.requestID,
+              PublishErrorCode::UNAUTHORIZED,
+              "Not authorized"
+          }
+      );
+    }
+    
+    // Create consumer to receive data
+    auto consumer = std::make_shared<MyTrackConsumer>(pub.fullTrackName);
+    
+    // Create async reply task
+    auto replyTask = [this, pub]() -> folly::coro::Task<
+        folly::Expected<PublishOk, PublishError>> {
+      // Perform async validation if needed
+      co_await validateAsync(pub.fullTrackName);
+      
+      co_return PublishOk{pub.requestID};
+    }();
+    
+    // Return consumer immediately
+    return PublishConsumerAndReplyTask{consumer, std::move(replyTask)};
+  }
+};
+```
+
+## Benefits of Symmetry
+
+### 1. Composability
+
+Components implementing both interfaces can be chained:
+
+```cpp
+// Filter component
+class VideoFilter : public Publisher, public Subscriber {
+  // Implements subscribe() to serve filtered data downstream
+  // Implements publish() to receive raw data upstream
+};
+
+// Chain: RawPublisher → VideoFilter → Session
+filter->subscribe(subReq, session->getConsumer());
+rawPublisher->publish(pubReq, filter->getConsumer());
+```
+
+### 2. Uniform Error Handling
+
+All operations return `folly::Expected` with typed errors:
+
+```cpp
+auto result = co_await publisher->subscribe(subReq, consumer);
+if (result.hasError()) {
+    const auto& err = result.error();
+    XLOG(ERR) << "Subscribe failed: " << err.reasonPhrase
+              << " (code=" << static_cast<int>(err.errorCode) << ")";
+}
+```
+
+### 3. Type Safety
+
+Handle types enforce correct lifecycle management:
+
+```cpp
+// SubscriptionHandle can only unsubscribe or update subscription
+auto subHandle = subscribeResult.value();
+subHandle->unsubscribe(); // OK
+
+// FetchHandle can only cancel or update fetch
+auto fetchHandle = fetchResult.value();
+fetchHandle->fetchCancel(); // OK
+
+// Compiler prevents misuse (e.g., calling unsubscribe on fetch)
+```
+
+### 4. Testability
+
+Mock implementations for testing:
+
+```cpp
+class MockPublisher : public Publisher {
+  MOCK_METHOD(folly::coro::Task<SubscribeResult>, subscribe,
+              (SubscribeRequest, std::shared_ptr<TrackConsumer>), (override));
+  MOCK_METHOD(folly::coro::Task<FetchResult>, fetch,
+              (Fetch, std::shared_ptr<FetchConsumer>), (override));
+};
+
+// Test your subscriber against mock publisher
+TEST(MySubscriberTest, HandlesSubscribeError) {
+  MockPublisher mockPub;
+  EXPECT_CALL(mockPub, subscribe)
+      .WillOnce(Return(makeUnexpected(SubscribeError{...})));
+  
+  auto result = mySubscriber.subscribeUpstream(&mockPub, ...);
+  EXPECT_TRUE(result.hasError());
+}
+```
+
+## Real-World Example: Building a Relay
+
+A relay implements both interfaces to forward data between sessions:
+
+```cpp
+class SimpleRelay : public Publisher, public Subscriber {
+ private:
+  std::shared_ptr<MoQSession> upstreamSession_;
+  std::shared_ptr<MoQForwarder> forwarder_;
+
+ public:
+  // Publisher interface: handle downstream subscribe requests
+  folly::coro::Task<SubscribeResult> subscribe(
+      SubscribeRequest sub,
+      std::shared_ptr<TrackConsumer> consumer) override {
+    
+    // Subscribe to upstream publisher
+    auto upstreamResult = co_await upstreamSession_->subscribe(
+        sub,
+        forwarder_
+    );
+    
+    if (upstreamResult.hasError()) {
+      co_return folly::makeUnexpected(upstreamResult.error());
+    }
+    
+    // Add downstream consumer to forwarder
+    auto relayHandle = forwarder_->addSubscriber(
+        downstreamSession,
+        sub,
+        consumer
+    );
+    
+    co_return relayHandle;
+  }
+  
+  // Subscriber interface: handle upstream namespace announcements
+  folly::coro::Task<PublishNamespaceResult> publishNamespace(
+      PublishNamespace ann,
+      std::shared_ptr<PublishNamespaceCallback> callback) override {
+    
+    // Forward namespace to all downstream subscribers
+    for (auto& downstream : downstreamSessions_) {
+      co_await downstream->publishNamespace(ann, callback);
+    }
+    
+    co_return PublishNamespaceHandle{...};
+  }
+};
+```
+
+See [Relay & Forwarding](/concepts/relay-forwarding) for complete relay implementation details.
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Flow Control" icon="gauge-high" href="/concepts/flow-control">
+    Learn backpressure and buffering strategies
+  </Card>
+  <Card title="Relay & Forwarding" icon="server" href="/concepts/relay-forwarding">
+    Build relay servers with MoQForwarder
+  </Card>
+  <Card title="Quickstart" icon="rocket" href="/getting-started/quickstart">
+    Build your first publisher and subscriber
+  </Card>
+  <Card title="API Reference" icon="book" href="/api-reference/classes/moqsession">
+    Full API documentation
+  </Card>
+</CardGroup>

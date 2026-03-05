@@ -1,0 +1,347 @@
+---
+title: "FLV Parser"
+description: "FLV (Flash Video) format parsing and writing for media streaming"
+---
+
+## Overview
+
+The FLV parser provides utilities for reading and writing FLV (Flash Video) format files. FLV is used in moxygen as an interchange format for testing media streaming because it's simple, streaming-friendly, and works well with ffmpeg.
+
+**Source**: `moxygen/flv_parser/`
+
+## Key Classes
+
+<CardGroup cols={2}>
+  <Card title="FlvReader" icon="file-import">
+    Read FLV files or streams sequentially
+  </Card>
+  <Card title="FlvWriter" icon="file-export">
+    Write FLV files or streams
+  </Card>
+  <Card title="FlvStreamParser" icon="stream">
+    Parse FLV streams with callback-based API
+  </Card>
+  <Card title="FlvCoder" icon="code">
+    Encode/decode FLV tag headers and metadata
+  </Card>
+</CardGroup>
+
+## FLV Format Overview
+
+FLV is a container format consisting of:
+
+```
+FLV Header (9 bytes)
+  - Signature: "FLV"
+  - Version: 1
+  - Flags: has_video | has_audio
+  - Header size: 9
+
+FLV Body:
+  Tag 1 (video/audio/script)
+  Tag 2
+  Tag 3
+  ...
+```
+
+Each tag contains:
+- **Tag type**: Video (9), Audio (8), or Script Data (18)
+- **Data size**: Size of tag payload
+- **Timestamp**: Presentation timestamp in milliseconds
+- **Stream ID**: Always 0
+- **Payload**: Encoded video/audio data
+
+## FlvReader
+
+Reads FLV files sequentially:
+
+```cpp FlvReader.h
+class FlvReader {
+ public:
+  explicit FlvReader(const std::string& filename);
+  
+  struct Tag {
+    enum Type { VIDEO = 9, AUDIO = 8, SCRIPT = 18 };
+    Type type;
+    uint32_t timestamp;  // milliseconds
+    Payload data;
+    bool isKeyframe() const;  // For video tags
+  };
+  
+  std::optional<Tag> readTag();
+  bool hasMore() const;
+};
+```
+
+**Usage**:
+```cpp read_flv.cpp
+FlvReader reader("input.flv");
+
+while (auto tag = reader.readTag()) {
+  switch (tag->type) {
+    case FlvReader::Tag::VIDEO:
+      processVideo(tag->timestamp, tag->data, tag->isKeyframe());
+      break;
+    case FlvReader::Tag::AUDIO:
+      processAudio(tag->timestamp, tag->data);
+      break;
+  }
+}
+```
+
+## FlvWriter
+
+Writes FLV files:
+
+```cpp FlvWriter.h
+class FlvWriter {
+ public:
+  explicit FlvWriter(const std::string& filename);
+  
+  void writeHeader(bool hasVideo, bool hasAudio);
+  void writeVideoTag(uint32_t timestamp, Payload data, bool keyframe);
+  void writeAudioTag(uint32_t timestamp, Payload data);
+  void close();
+};
+```
+
+**Usage**:
+```cpp write_flv.cpp
+FlvWriter writer("output.flv");
+writer.writeHeader(/* hasVideo */ true, /* hasAudio */ true);
+
+// Write video tag
+writer.writeVideoTag(
+  /* timestamp */ 0,
+  std::move(encodedFrame),
+  /* keyframe */ true
+);
+
+// Write audio tag
+writer.writeAudioTag(
+  /* timestamp */ 0,
+  std::move(encodedAudio)
+);
+
+writer.close();
+```
+
+## FlvStreamParser
+
+Callback-based streaming parser:
+
+```cpp FlvStreamParser.h
+class FlvStreamParser {
+ public:
+  FlvStreamParser();
+  
+  void setOnVideoFrame(std::function<void(VideoFrame)> callback);
+  void setOnAudioFrame(std::function<void(AudioFrame)> callback);
+  void setOnMetadata(std::function<void(Metadata)> callback);
+  
+  void parse(const uint8_t* data, size_t length);
+};
+```
+
+**Usage**:
+```cpp stream_parser.cpp
+FlvStreamParser parser;
+
+parser.setOnVideoFrame([](const VideoFrame& frame) {
+  if (frame.isKeyframe) {
+    // Start new GOP
+  }
+  // Process video frame
+});
+
+parser.setOnAudioFrame([](const AudioFrame& frame) {
+  // Process audio frame
+});
+
+// Feed data from file/pipe/network
+while (auto chunk = readChunk()) {
+  parser.parse(chunk.data(), chunk.size());
+}
+```
+
+## Video Frame Structure
+
+### H.264/AVC Video Tags
+
+FLV video tags for H.264 contain:
+
+```cpp
+struct VideoTag {
+  // Frame type
+  uint8_t frameType:4;  // 1=keyframe, 2=inter
+  uint8_t codecId:4;    // 7=AVC
+  
+  // AVC packet type
+  uint8_t avcPacketType;  // 0=sequence header, 1=NALU, 2=end
+  
+  // Composition time offset
+  int32_t compositionTime;  // For B-frames
+  
+  // Payload:
+  // - If avcPacketType==0: AVCDecoderConfigurationRecord (SPS/PPS)
+  // - If avcPacketType==1: One or more NAL units
+};
+```
+
+**AVCDecoderConfigurationRecord**:
+```cpp
+struct AVCDecoderConfigurationRecord {
+  uint8_t configurationVersion;  // 1
+  uint8_t AVCProfileIndication;  // e.g., 66=baseline, 77=main, 100=high
+  uint8_t profile_compatibility;
+  uint8_t AVCLevelIndication;    // e.g., 30=3.0, 31=3.1
+  uint8_t lengthSizeMinusOne;    // Usually 3 (4-byte NAL lengths)
+  
+  // SPS (Sequence Parameter Set)
+  uint8_t numOfSequenceParameterSets;
+  uint16_t sequenceParameterSetLength;
+  uint8_t* sequenceParameterSetNALUnit;
+  
+  // PPS (Picture Parameter Set)
+  uint8_t numOfPictureParameterSets;
+  uint16_t pictureParameterSetLength;
+  uint8_t* pictureParameterSetNALUnit;
+};
+```
+
+### AAC Audio Tags
+
+FLV audio tags for AAC contain:
+
+```cpp
+struct AudioTag {
+  // Format
+  uint8_t soundFormat:4;   // 10=AAC
+  uint8_t soundRate:2;     // 0=5.5kHz, 1=11kHz, 2=22kHz, 3=44kHz
+  uint8_t soundSize:1;     // 0=8bit, 1=16bit
+  uint8_t soundType:1;     // 0=mono, 1=stereo
+  
+  // AAC packet type
+  uint8_t aacPacketType;  // 0=sequence header, 1=raw
+  
+  // Payload:
+  // - If aacPacketType==0: AudioSpecificConfig
+  // - If aacPacketType==1: AAC frame data
+};
+```
+
+**AudioSpecificConfig (ASC)**:
+```cpp
+struct AudioSpecificConfig {
+  uint8_t audioObjectType:5;    // 2=AAC-LC
+  uint8_t samplingFrequencyIndex:4;
+  uint8_t channelConfiguration:4;
+  // ... other fields
+};
+```
+
+## Integration with ffmpeg
+
+### Creating FLV with ffmpeg
+
+```bash generate_flv.sh
+# Generate test pattern with audio
+ffmpeg -f lavfi -re -i smptebars=duration=60:size=1280x720:rate=30 \
+       -f lavfi -re -i sine=frequency=1000:duration=60:sample_rate=48000 \
+       -pix_fmt yuv420p \
+       -c:v libx264 -b:v 500k -g 60 -keyint_min 60 \
+       -profile:v baseline -preset veryfast \
+       -c:a aac -b:a 128k \
+       -f flv output.flv
+```
+
+### Reading FLV with ffmpeg
+
+```bash play_flv.sh
+ffplay output.flv
+
+# Or get info
+ffprobe output.flv
+```
+
+## Usage in MoQFlvStreamerClient
+
+```cpp MoQFlvStreamerClient.cpp
+FlvStreamParser parser_;
+
+parser_.setOnVideoFrame([this](const VideoFrame& frame) {
+  if (frame.isAVCSequenceHeader) {
+    // Store decoder config
+    avcDecoderConfig_ = clone(frame.data);
+  } else {
+    // Publish video frame
+    publishVideoFrame(frame);
+  }
+});
+
+parser_.setOnAudioFrame([this](const AudioFrame& frame) {
+  if (frame.isAACSequenceHeader) {
+    // Store audio config
+    audioSpecificConfig_ = clone(frame.data);
+  } else {
+    // Publish audio frame
+    publishAudioFrame(frame);
+  }
+});
+
+// Read FLV file
+std::ifstream flvFile(inputPath_, std::ios::binary);
+while (flvFile.read(buffer, sizeof(buffer))) {
+  parser_.parse(buffer, flvFile.gcount());
+}
+```
+
+## Usage in MoQFlvReceiverClient
+
+```cpp MoQFlvReceiverClient.cpp
+FlvWriter writer_(outputPath_);
+
+void onVideoFrame(Payload data, uint32_t timestamp, bool keyframe) {
+  writer_.writeVideoTag(timestamp, std::move(data), keyframe);
+}
+
+void onAudioFrame(Payload data, uint32_t timestamp) {
+  writer_.writeAudioTag(timestamp, std::move(data));
+}
+```
+
+## Why FLV?
+
+<Accordion title="Streaming Friendly">
+  Simple tag-based format - can start playing before download completes
+</Accordion>
+
+<Accordion title="ffmpeg Support">
+  Excellent ffmpeg integration for encoding, decoding, muxing, demuxing
+</Accordion>
+
+<Accordion title="Simple Parsing">
+  Much simpler than MP4/fragmented MP4 - no moov/moof boxes to handle
+</Accordion>
+
+<Accordion title="Real-Time Muxing">
+  Can mux in real-time with low latency - no need to seek back and update headers
+</Accordion>
+
+<Accordion title="Codec Headers">
+  Clean separation of codec config (AVCDecoderRecord, ASC) and media frames
+</Accordion>
+
+## Related Classes
+
+<CardGroup cols={3}>
+  <Card title="MoQMi" href="/api/moq-mi">
+    Media packaging for MOQT
+  </Card>
+  <Card title="Media Streaming Guide" href="/guides/media-streaming">
+    Complete workflow
+  </Card>
+  <Card title="FLV Streaming Sample" href="/samples/flv-streaming">
+    Working examples
+  </Card>
+</CardGroup>

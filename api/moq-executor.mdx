@@ -1,0 +1,357 @@
+---
+title: "MoQExecutor"
+description: "Event loop abstraction for executing callbacks and scheduling timers"
+---
+
+## Overview
+
+`MoQExecutor` is an abstract interface for event-driven execution. It extends `folly::Executor` and provides additional timer scheduling capabilities. All MoQSession operations run on an executor to ensure thread-safe event-driven behavior.
+
+**Source**: `moxygen/events/MoQExecutor.h`
+
+## Interface
+
+```cpp MoQExecutor.h
+class MoQExecutor : public folly::Executor {
+ public:
+  virtual ~MoQExecutor() = default;
+  
+  // Timer scheduling
+  virtual void scheduleTimeout(
+      quic::QuicTimerCallback* callback,
+      std::chrono::milliseconds timeout) = 0;
+  
+  // Inherited from folly::Executor
+  virtual void add(folly::Func func) = 0;
+  
+  // Type-safe downcast helper
+  template <
+      typename T,
+      typename = std::enable_if_t<std::is_base_of_v<MoQExecutor, T>>>
+  T* getTypedExecutor();
+};
+```
+
+## Methods
+
+### scheduleTimeout
+
+Schedules a callback to run after a specified delay.
+
+```cpp
+virtual void scheduleTimeout(
+    quic::QuicTimerCallback* callback,
+    std::chrono::milliseconds timeout) = 0;
+```
+
+<ParamField path="callback" type="quic::QuicTimerCallback*">
+  Timer callback to invoke when timeout expires
+</ParamField>
+
+<ParamField path="timeout" type="std::chrono::milliseconds">
+  Delay before invoking the callback
+</ParamField>
+
+**Used for**:
+- GOAWAY timeout
+- Control message timeout
+- Data stream timeout
+- Delivery timeout
+
+### add (from folly::Executor)
+
+Schedules a function to run on the executor.
+
+```cpp
+virtual void add(folly::Func func) = 0;
+```
+
+<ParamField path="func" type="folly::Func">
+  Function to execute (typically a lambda or std::function)
+</ParamField>
+
+### getTypedExecutor
+
+Attempts to downcast to a specific executor type.
+
+```cpp
+template <typename T>
+T* getTypedExecutor();
+```
+
+<ResponseField name="return" type="T*">
+  Pointer to the typed executor, or nullptr if cast fails
+</ResponseField>
+
+**Usage**:
+```cpp
+if (auto* follyEvb = executor->getTypedExecutor<MoQFollyExecutorImpl>()) {
+  folly::EventBase* evb = follyEvb->getEventBase();
+}
+```
+
+## Implementations
+
+### MoQFollyExecutorImpl
+
+Wraps a `folly::EventBase` to provide executor functionality.
+
+```cpp MoQFollyExecutorImpl.h
+class MoQFollyExecutorImpl : public MoQExecutor {
+ public:
+  explicit MoQFollyExecutorImpl(folly::EventBase* evb);
+  
+  void add(folly::Func func) override {
+    evb_->add(std::move(func));
+  }
+  
+  void scheduleTimeout(
+      quic::QuicTimerCallback* callback,
+      std::chrono::milliseconds timeout) override {
+    evb_->timer().scheduleTimeout(callback, timeout);
+  }
+  
+  folly::EventBase* getEventBase() { return evb_; }
+  
+ private:
+  folly::EventBase* evb_;
+};
+```
+
+**Usage**:
+```cpp folly_executor.cpp
+folly::EventBase evb;
+auto executor = std::make_shared<MoQFollyExecutorImpl>(&evb);
+
+auto session = std::make_shared<MoQSession>(wt, executor);
+
+// Run event loop
+evb.loop();
+```
+
+### MoQLibevExecutorImpl
+
+Wraps a libev event loop.
+
+```cpp MoQLibevExecutorImpl.h
+class MoQLibevExecutorImpl : public MoQExecutor {
+ public:
+  explicit MoQLibevExecutorImpl(struct ev_loop* loop);
+  
+  void add(folly::Func func) override;
+  void scheduleTimeout(
+      quic::QuicTimerCallback* callback,
+      std::chrono::milliseconds timeout) override;
+  
+ private:
+  struct ev_loop* loop_;
+};
+```
+
+**Usage**:
+```cpp libev_executor.cpp
+struct ev_loop* loop = ev_loop_new(0);
+auto executor = std::make_shared<MoQLibevExecutorImpl>(loop);
+
+auto session = std::make_shared<MoQSession>(wt, executor);
+
+// Run event loop
+ev_run(loop, 0);
+```
+
+## Usage with MoQSession
+
+Every `MoQSession` requires an executor:
+
+```cpp session_with_executor.cpp
+// Create executor
+folly::EventBase evb;
+auto executor = std::make_shared<MoQFollyExecutorImpl>(&evb);
+
+// Create session with executor
+auto session = std::make_shared<MoQSession>(
+  webTransport,
+  executor
+);
+
+// Start session - all operations run on executor
+co_await session->start();
+
+// Run event loop - processes session events
+evb.loop();
+```
+
+## Event-Driven Flow
+
+All MoQSession operations are dispatched via the executor:
+
+```cpp event_flow.cpp
+class MoQSession {
+  // Control messages processed on executor
+  folly::coro::Task<void> controlReadLoop() {
+    while (true) {
+      auto msg = co_await readControlMessage();
+      // Process on this executor's thread
+      handleControlMessage(msg);
+    }
+  }
+  
+  // Callbacks dispatched via executor
+  void onStreamData(uint64_t streamId, Payload data) {
+    executor_->add([this, streamId, data = std::move(data)]() mutable {
+      processStreamData(streamId, std::move(data));
+    });
+  }
+};
+```
+
+## Threading Model
+
+<Warning>
+**Critical**: Each `MoQSession` must only be accessed from the thread running its executor. Never access a session from multiple threads.
+</Warning>
+
+```cpp threading_model.cpp
+// CORRECT: Session accessed only on executor thread
+folly::EventBase evb;
+auto executor = std::make_shared<MoQFollyExecutorImpl>(&evb);
+auto session = std::make_shared<MoQSession>(wt, executor);
+
+// All session operations happen on evb's thread
+evb.loop();
+
+// INCORRECT: Accessing session from different thread
+std::thread otherThread([session]() {
+  session->subscribe(req, consumer);  // CRASH: wrong thread!
+});
+```
+
+## Multi-Threaded Servers
+
+For multi-threaded servers, create separate executors per thread:
+
+```cpp multi_threaded_server.cpp
+class MoQRelayServer {
+  void start() {
+    // Create worker threads
+    for (int i = 0; i < numThreads; i++) {
+      workers_.emplace_back([this]() {
+        folly::EventBase evb;
+        workerEvbs_.push_back(&evb);
+        evb.loopForever();
+      });
+    }
+    
+    // Each accepted connection gets assigned to a worker
+    server_->setSessionFactory([this](auto wt) {
+      // Round-robin to worker threads
+      auto* workerEvb = workerEvbs_[nextWorker_++ % workerEvbs_.size()];
+      auto executor = std::make_shared<MoQFollyExecutorImpl>(workerEvb);
+      
+      // Session runs on this worker's thread
+      return std::make_shared<MoQRelaySession>(wt, executor);
+    });
+  }
+  
+  std::vector<std::thread> workers_;
+  std::vector<folly::EventBase*> workerEvbs_;
+  std::atomic<size_t> nextWorker_{0};
+};
+```
+
+## Scheduling Examples
+
+### Immediate Execution
+
+```cpp immediate.cpp
+executor->add([session]() {
+  // Runs on executor thread
+  session->doSomething();
+});
+```
+
+### Delayed Execution
+
+```cpp delayed.cpp
+class MyTimerCallback : public quic::QuicTimerCallback {
+  void timeoutExpired() noexcept override {
+    // Handle timeout on executor thread
+  }
+};
+
+MyTimerCallback callback;
+executor->scheduleTimeout(&callback, std::chrono::seconds(5));
+```
+
+### Cancellable Timer
+
+```cpp cancellable.cpp
+class MyTimerCallback : public quic::QuicTimerCallback {
+  void timeoutExpired() noexcept override {
+    if (!cancelled_) {
+      // Handle timeout
+    }
+  }
+  
+  void cancel() {
+    cancelled_ = true;
+    cancelTimeout();  // Cancel scheduled timeout
+  }
+  
+  bool cancelled_{false};
+};
+```
+
+## getExecutor Convenience
+
+`MoQSession` provides access to its executor:
+
+```cpp get_executor.cpp
+auto session = createSession();
+
+// Schedule work on session's executor
+session->getExecutor()->add([session]() {
+  // Safe: runs on session's thread
+  session->doWork();
+});
+```
+
+## Best Practices
+
+<Accordion title="One Session Per Thread">
+  Each session should only be accessed from its executor's thread. Never share sessions across threads.
+</Accordion>
+
+<Accordion title="Use folly::EventBase for Most Cases">
+  Unless you have a specific requirement for libev, use `MoQFollyExecutorImpl` with `folly::EventBase`.
+</Accordion>
+
+<Accordion title="Dispatch Cross-Thread Calls">
+  If you need to call session methods from another thread, dispatch via the executor:
+  
+  ```cpp
+  otherThread.call([session]() {
+    session->getExecutor()->add([session]() {
+      session->doWork();  // Now safe
+    });
+  });
+  ```
+</Accordion>
+
+<Accordion title="Share Executors Carefully">
+  Multiple sessions can share the same executor (and thread), but be mindful of blocking operations.
+</Accordion>
+
+## Related Classes
+
+<CardGroup cols={3}>
+  <Card title="MoQSession" href="/api/moq-session">
+    Requires an executor for all operations
+  </Card>
+  <Card title="Threading Model" href="/guides/threading-model">
+    Thread safety guidelines
+  </Card>
+  <Card title="MoQServer" href="/api/moq-server">
+    Multi-threaded server example
+  </Card>
+</CardGroup>

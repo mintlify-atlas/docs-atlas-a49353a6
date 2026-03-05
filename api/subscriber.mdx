@@ -1,0 +1,434 @@
+---
+title: Subscriber
+description: Interface for handling publish requests and namespace announcements
+---
+
+## Overview
+
+The `Subscriber` interface defines the contract for components that can receive track publish requests and namespace announcements. It provides methods for handling `PUBLISH_NAMESPACE` and `PUBLISH` messages.
+
+**Header:** `moxygen/Subscriber.h`
+
+### Symmetric Design
+
+The Subscriber interface follows the same symmetric design as Publisher:
+- **Publishers call** methods like `publish()` on a subscriber to send data
+- **Subscribers implement** these methods to handle incoming data
+- This enables **chaining**: subscribers can republish to downstream components
+
+### Key Concepts
+
+- **Coroutine-Based**: `publishNamespace()` returns `folly::coro::Task` for async operations
+- **Synchronous Publish**: `publish()` returns synchronously with both consumer and async reply task
+- **Expected Types**: Methods return `folly::Expected<Success, Error>` for error handling
+- **Handle-Based**: Successful operations return handles for lifecycle management
+
+## Interface Definition
+
+```cpp
+class Subscriber {
+ public:
+  virtual ~Subscriber() = default;
+  
+  virtual folly::coro::Task<PublishNamespaceResult> publishNamespace(
+      PublishNamespace ann,
+      std::shared_ptr<PublishNamespaceCallback> = nullptr);
+  
+  virtual PublishResult publish(
+      PublishRequest pub,
+      std::shared_ptr<SubscriptionHandle> handle = nullptr);
+  
+  virtual void goaway(Goaway goaway);
+};
+```
+
+## Methods
+
+### publishNamespace
+
+```cpp
+virtual folly::coro::Task<PublishNamespaceResult> publishNamespace(
+    PublishNamespace ann,
+    std::shared_ptr<PublishNamespaceCallback> = nullptr
+);
+```
+
+Handles a `PUBLISH_NAMESPACE` announcement indicating that tracks within a namespace are available for subscription.
+
+<ParamField path="ann" type="PublishNamespace" required>
+  Namespace publish announcement containing:
+  - `requestID`: Unique request identifier
+  - `trackNamespace`: Namespace tuple (e.g., `{"conference", "room-1"}`) being published
+  - `params`: Optional parameters for authentication or metadata
+</ParamField>
+
+<ParamField path="callback" type="std::shared_ptr<PublishNamespaceCallback>">
+  Optional callback that the subscriber can use to issue `publishNamespaceCancel()` notifications
+</ParamField>
+
+<ResponseField name="PublishNamespaceResult" type="folly::Expected<std::shared_ptr<PublishNamespaceHandle>, PublishNamespaceError>">
+  On success, returns a `PublishNamespaceHandle` for managing the announcement lifecycle. On failure, returns `PublishNamespaceError`.
+</ResponseField>
+
+**Default Implementation:** Returns `NOT_SUPPORTED` error.
+
+**Usage:**
+
+```cpp
+class MySubscriber : public Subscriber {
+  folly::coro::Task<PublishNamespaceResult> publishNamespace(
+      PublishNamespace ann,
+      std::shared_ptr<PublishNamespaceCallback> callback) override {
+    
+    // Validate namespace
+    if (!isAuthorized(ann.trackNamespace)) {
+      PublishNamespaceError err{
+        ann.requestID,
+        PublishNamespaceErrorCode::UNAUTHORIZED,
+        "Not authorized"
+      };
+      co_return folly::makeUnexpected(err);
+    }
+    
+    // Register namespace
+    registerNamespace(ann.trackNamespace);
+    
+    // Create handle
+    auto handle = std::make_shared<MyPublishNamespaceHandle>(
+      ann.requestID, ann.trackNamespace);
+    
+    PublishNamespaceOk ok;
+    ok.requestID = ann.requestID;
+    handle->setPublishNamespaceOk(std::move(ok));
+    
+    co_return handle;
+  }
+};
+```
+
+### publish
+
+```cpp
+virtual PublishResult publish(
+    PublishRequest pub,
+    std::shared_ptr<SubscriptionHandle> handle = nullptr
+);
+```
+
+Handles a `PUBLISH` request, allowing a remote peer to publish a track. This method returns **synchronously** with both a consumer for receiving objects and an async reply task for the `PUBLISH_OK` response.
+
+<ParamField path="pub" type="PublishRequest" required>
+  Publish request containing:
+  - `requestID`: Unique request identifier (draft 15+)
+  - `trackNamespace`: Namespace tuple
+  - `trackName`: Track name
+  - `priority`: Publisher priority (0-255)
+  - `groupOrder`: Suggested group order
+  - `params`: Optional parameters (authorization, delivery timeout, etc.)
+</ParamField>
+
+<ParamField path="handle" type="std::shared_ptr<SubscriptionHandle>">
+  Optional subscription handle if this publish is forwarding an upstream subscription
+</ParamField>
+
+<ResponseField name="PublishResult" type="folly::Expected<PublishConsumerAndReplyTask, PublishError>">
+  On success, returns a struct containing:
+  - `consumer`: `std::shared_ptr<TrackConsumer>` for receiving objects
+  - `reply`: `folly::coro::Task<folly::Expected<PublishOk, PublishError>>` for async response
+  
+  On failure, returns `PublishError`.
+</ResponseField>
+
+**Default Implementation:** Returns `NOT_SUPPORTED` error.
+
+**Usage:**
+
+```cpp
+class MySubscriber : public Subscriber {
+  PublishResult publish(
+      PublishRequest pub,
+      std::shared_ptr<SubscriptionHandle> handle) override {
+    
+    // Validate publish
+    if (!canPublish(pub.trackNamespace, pub.trackName)) {
+      return folly::makeUnexpected(PublishError{
+        pub.requestID,
+        PublishErrorCode::UNAUTHORIZED,
+        "Not authorized to publish"
+      });
+    }
+    
+    // Create consumer immediately
+    auto consumer = std::make_shared<MyTrackConsumer>();
+    
+    // Create async reply task
+    auto replyTask = [this, pub, consumer]() -> folly::coro::Task<
+        folly::Expected<PublishOk, PublishError>> {
+      
+      // Do async validation/setup
+      co_await validateAsync(pub);
+      
+      // Return PUBLISH_OK
+      PublishOk ok;
+      ok.requestID = pub.requestID;
+      co_return ok;
+    }();
+    
+    return PublishConsumerAndReplyTask{
+      .consumer = consumer,
+      .reply = std::move(replyTask)
+    };
+  }
+};
+```
+
+### goaway
+
+```cpp
+virtual void goaway(Goaway goaway);
+```
+
+Notifies the subscriber of a `GOAWAY` message, indicating graceful shutdown.
+
+<ParamField path="goaway" type="Goaway" required>
+  Goaway message containing optional new URI for reconnection
+</ParamField>
+
+**Default Implementation:** No-op.
+
+## Nested Classes
+
+### PublishNamespaceHandle
+
+```cpp
+class PublishNamespaceHandle {
+ public:
+  PublishNamespaceHandle() = default;
+  explicit PublishNamespaceHandle(PublishNamespaceOk annOk);
+  virtual ~PublishNamespaceHandle() = default;
+  
+  virtual void publishNamespaceDone();
+  
+  using RequestUpdateResult = folly::Expected<RequestOk, RequestError>;
+  virtual folly::coro::Task<RequestUpdateResult> requestUpdate(
+      RequestUpdate reqUpdate);
+  
+  const PublishNamespaceOk& publishNamespaceOk() const;
+};
+```
+
+Handle returned from successful `publishNamespace()` calls.
+
+#### publishNamespaceDone
+
+```cpp
+virtual void publishNamespaceDone();
+```
+
+Signals that the namespace is no longer being published, sending a `PUBLISH_NAMESPACE_DONE` message.
+
+**Default Implementation:** No-op.
+
+**Usage:**
+
+```cpp
+auto result = co_await session->publishNamespace(publishNs, callback);
+if (result.hasValue()) {
+  auto handle = result.value();
+  
+  // ... publish tracks in this namespace ...
+  
+  // Signal completion
+  handle->publishNamespaceDone();
+}
+```
+
+#### requestUpdate
+
+```cpp
+virtual folly::coro::Task<RequestUpdateResult> requestUpdate(
+    RequestUpdate reqUpdate
+);
+```
+
+Updates namespace parameters (draft 15+).
+
+<ParamField path="reqUpdate" type="RequestUpdate" required>
+  Update request containing new parameters
+</ParamField>
+
+<ResponseField name="RequestUpdateResult" type="folly::Expected<RequestOk, RequestError>">
+  On success, returns `RequestOk`. On failure, returns `RequestError`.
+</ResponseField>
+
+**Default Implementation:** Returns `NOT_SUPPORTED` error.
+
+### PublishNamespaceCallback
+
+```cpp
+class PublishNamespaceCallback {
+ public:
+  virtual ~PublishNamespaceCallback() = default;
+  
+  virtual void publishNamespaceCancel(
+      PublishNamespaceErrorCode errorCode,
+      std::string reasonPhrase) = 0;
+};
+```
+
+Callback interface provided by the subscriber to receive `PUBLISH_NAMESPACE_CANCEL` notifications from the publisher.
+
+#### publishNamespaceCancel
+
+```cpp
+virtual void publishNamespaceCancel(
+    PublishNamespaceErrorCode errorCode,
+    std::string reasonPhrase
+) = 0;
+```
+
+Called when the publisher cancels the namespace announcement.
+
+<ParamField path="errorCode" type="PublishNamespaceErrorCode" required>
+  Error code indicating reason for cancellation
+</ParamField>
+
+<ParamField path="reasonPhrase" type="std::string" required>
+  Human-readable reason for cancellation
+</ParamField>
+
+**Usage:**
+
+```cpp
+class MyCallback : public PublishNamespaceCallback {
+  void publishNamespaceCancel(
+      PublishNamespaceErrorCode errorCode,
+      std::string reasonPhrase) override {
+    XLOG(INFO) << "Namespace cancelled: " << reasonPhrase;
+    // Clean up resources
+  }
+};
+
+auto callback = std::make_shared<MyCallback>();
+co_await session->publishNamespace(publishNs, callback);
+```
+
+### PublishConsumerAndReplyTask
+
+```cpp
+struct PublishConsumerAndReplyTask {
+  std::shared_ptr<TrackConsumer> consumer;
+  folly::coro::Task<folly::Expected<PublishOk, PublishError>> reply;
+};
+```
+
+Return type for the synchronous `publish()` method.
+
+<ParamField path="consumer" type="std::shared_ptr<TrackConsumer>" required>
+  Consumer that will receive objects published by the peer. The publisher writes to this consumer immediately.
+</ParamField>
+
+<ParamField path="reply" type="folly::coro::Task<folly::Expected<PublishOk, PublishError>>" required>
+  Async task that completes with the `PUBLISH_OK` response or error. The application should `co_await` this task to send the response.
+</ParamField>
+
+## Implementation Example
+
+```cpp
+class RelaySubscriber : public Subscriber {
+ private:
+  std::map<TrackNamespace, std::vector<std::shared_ptr<Subscriber>>> downstream_;
+  
+ public:
+  folly::coro::Task<PublishNamespaceResult> publishNamespace(
+      PublishNamespace ann,
+      std::shared_ptr<PublishNamespaceCallback> callback) override {
+    
+    // Accept announcement
+    auto handle = std::make_shared<MyPublishNamespaceHandle>();
+    PublishNamespaceOk ok{.requestID = ann.requestID};
+    handle->setPublishNamespaceOk(std::move(ok));
+    
+    // Forward to downstream subscribers
+    for (auto& downstream : downstream_[ann.trackNamespace]) {
+      co_await downstream->publishNamespace(ann, callback);
+    }
+    
+    co_return handle;
+  }
+  
+  PublishResult publish(
+      PublishRequest pub,
+      std::shared_ptr<SubscriptionHandle> handle) override {
+    
+    // Create forwarder
+    auto forwarder = std::make_shared<MoQForwarder>(
+      FullTrackName{pub.trackNamespace, pub.trackName});
+    
+    // Return consumer and async reply
+    auto replyTask = [this, pub, forwarder]() -> folly::coro::Task<
+        folly::Expected<PublishOk, PublishError>> {
+      
+      // Register track
+      registerTrack(pub.trackNamespace, pub.trackName, forwarder);
+      
+      PublishOk ok{.requestID = pub.requestID};
+      co_return ok;
+    }();
+    
+    return PublishConsumerAndReplyTask{
+      .consumer = forwarder,
+      .reply = std::move(replyTask)
+    };
+  }
+};
+```
+
+## Comparison with Publisher
+
+| Aspect | Publisher | Subscriber |
+|--------|-----------|------------|
+| Primary role | Serves content | Receives content |
+| Key method | `subscribe()` | `publish()` |
+| Namespace method | `subscribeNamespace()` | `publishNamespace()` |
+| Return pattern | Async (Task) | Sync + async reply |
+| Handle type | `SubscriptionHandle` | `PublishNamespaceHandle` |
+| Consumer direction | Returns handle, writes to callback | Returns consumer, receives from peer |
+
+## Synchronous Publish Pattern
+
+The `publish()` method uses a unique **synchronous with async reply** pattern:
+
+```cpp
+// 1. Call returns immediately with consumer
+auto result = session->publish(pubReq);
+if (result.hasError()) {
+  // Handle error
+  return;
+}
+
+auto& [consumer, replyTask] = result.value();
+
+// 2. Peer can start writing objects immediately
+// (objects arrive via consumer callbacks)
+
+// 3. Application awaits reply task to send PUBLISH_OK
+auto reply = co_await std::move(replyTask);
+if (reply.hasValue()) {
+  // PUBLISH_OK sent
+} else {
+  // PUBLISH_ERROR sent
+}
+```
+
+This pattern allows:
+- **Immediate data flow**: Peer doesn't wait for OK to start sending
+- **Async validation**: Application can do async setup before responding
+- **Error handling**: Application can reject publish after inspecting initial data
+
+## Related Classes
+
+- [MoQSession](/api/moq-session) - Implements Subscriber for network communication
+- [Publisher](/api/publisher) - Symmetric interface for subscribers
+- [TrackConsumer](/api/track-consumer) - Receives objects from publish requests
+- [MoQRelay](/guides/relay-server) - Example subscriber implementation

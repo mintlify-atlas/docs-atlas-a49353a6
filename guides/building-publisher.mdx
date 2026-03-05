@@ -1,0 +1,289 @@
+---
+title: Building a Publisher
+description: Step-by-step guide to creating a MoQ publisher application
+---
+
+This guide walks you through building a MOQT publisher from scratch using the Moxygen library. We'll use the date server sample as a practical example.
+
+## Overview
+
+A MoQ publisher:
+- Implements the `Publisher` interface to handle subscription requests
+- Uses `MoQServer` to accept client connections
+- Publishes objects to subscribers via `TrackConsumer` interfaces
+- Manages subscription lifecycle and handles unsubscribe requests
+
+## Prerequisites
+
+```cpp
+#include <moxygen/MoQServer.h>
+#include <moxygen/MoQClient.h>
+#include <moxygen/relay/MoQForwarder.h>
+```
+
+<Steps>
+
+### Step 1: Implement the Publisher Interface
+
+Create a class that extends `Publisher` to handle subscription requests:
+
+```cpp
+class DatePublisher : public Publisher {
+ public:
+  explicit DatePublisher(
+      Mode mode,
+      std::string ns = "moq-date",
+      int deliveryTimeout = 0)
+      : mode_(mode),
+        ns_(std::move(ns)),
+        deliveryTimeout_(deliveryTimeout),
+        forwarder_(dateTrackName()) {}
+
+  // Handle incoming subscribe requests
+  folly::coro::Task<SubscribeResult> subscribe(
+      SubscribeRequest subReq,
+      std::shared_ptr<TrackConsumer> consumer) override;
+
+  // Handle track status requests
+  folly::coro::Task<TrackStatusResult> trackStatus(
+      TrackStatus trackStatus) override;
+
+  // Handle fetch requests for historical data
+  folly::coro::Task<FetchResult> fetch(
+      Fetch fetch,
+      std::shared_ptr<FetchConsumer> consumer) override;
+
+ private:
+  FullTrackName dateTrackName() const {
+    return FullTrackName({TrackNamespace({ns_}), "date"});
+  }
+
+  Mode mode_;
+  std::string ns_;
+  MoQForwarder forwarder_;
+};
+```
+
+### Step 2: Handle Subscribe Requests
+
+Implement the `subscribe()` method to validate requests and add subscribers:
+
+```cpp
+folly::coro::Task<SubscribeResult> DatePublisher::subscribe(
+    SubscribeRequest subReq,
+    std::shared_ptr<TrackConsumer> consumer) {
+  XLOG(INFO) << "SubscribeRequest track ns="
+             << subReq.fullTrackName.trackNamespace
+             << " name=" << subReq.fullTrackName.trackName
+             << " requestID=" << subReq.requestID;
+
+  // Verify the track name matches
+  if (subReq.fullTrackName != dateTrackName()) {
+    co_return folly::makeUnexpected(
+        SubscribeError{
+            subReq.requestID,
+            SubscribeErrorCode::TRACK_NOT_EXIST,
+            "unexpected subscribe"});
+  }
+
+  // Set track alias
+  auto alias = TrackAlias(subReq.requestID.value);
+  consumer->setTrackAlias(alias);
+
+  // Get current session from request context
+  auto session = MoQSession::getRequestSession();
+
+  // Add subscriber to forwarder for fan-out
+  auto subscriber = forwarder_.addSubscriber(
+      std::move(session), subReq, std::move(consumer));
+
+  co_return subscriber;
+}
+```
+
+### Step 3: Publish Objects
+
+Use the `MoQForwarder` to publish data to all subscribers:
+
+<CodeGroup>
+
+```cpp Stream Per Group
+// Open a subgroup for the group
+auto subgroupPublisher =
+    forwarder_.beginSubgroup(group, subgroup, priority).value();
+
+// Publish objects in the subgroup
+subgroupPublisher->object(
+    objectId,
+    payload,
+    extensions,
+    false /* finSubgroup */);
+
+// Close the subgroup
+subgroupPublisher->endOfGroup(lastObjectId);
+```
+
+```cpp Stream Per Object
+// Each object gets its own stream
+ObjectHeader header{
+    group,
+    subgroup,
+    objectId,
+    priority,
+    ObjectStatus::NORMAL,
+    extensions,
+    std::nullopt};
+
+forwarder_.objectStream(header, payload);
+```
+
+```cpp Datagram
+// Send as unreliable datagram
+ObjectHeader header{
+    group,
+    0, // subgroup unused for datagrams
+    objectId,
+    priority,
+    ObjectStatus::NORMAL,
+    extensions,
+    std::nullopt};
+
+forwarder_.datagram(header, payload);
+```
+
+</CodeGroup>
+
+### Step 4: Create Publishing Loop
+
+Implement a loop to continuously publish data:
+
+```cpp
+folly::coro::Task<void> DatePublisher::publishDateLoop() {
+  auto cancelToken = co_await folly::coro::co_current_cancellation_token;
+
+  while (!cancelToken.isCancellationRequested()) {
+    auto [minute, second] = now();
+
+    if (!forwarder_.empty()) {
+      // Publish current time
+      auto subgroupPublisher = forwarder_.beginSubgroup(
+          minute, 0, /*priority=*/0).value();
+
+      if (second == 0) {
+        // Publish minute payload
+        subgroupPublisher->object(
+            0, minutePayload(minute), extensions, false);
+      }
+
+      // Publish second payload
+      subgroupPublisher->object(
+          second + 1, secondPayload(second + 1), noExtensions(), false);
+
+      if (second >= 60) {
+        subgroupPublisher->endOfGroup(61);
+      }
+    }
+
+    co_await folly::coro::sleep(std::chrono::seconds(1));
+  }
+}
+```
+
+### Step 5: Set Up MoQServer
+
+Wrap your publisher in a server class:
+
+```cpp
+class MoQDateServer : public MoQServer {
+ public:
+  MoQDateServer(
+      const std::string& cert,
+      const std::string& key,
+      const std::string& endpoint,
+      std::shared_ptr<DatePublisher> publisher)
+      : MoQServer(cert, key, endpoint),
+        publisher_(std::move(publisher)) {}
+
+  void onNewSession(std::shared_ptr<MoQSession> clientSession) override {
+    // Set your publisher as the handler for subscribe requests
+    clientSession->setPublishHandler(publisher_);
+  }
+
+  void terminateClientSession(std::shared_ptr<MoQSession> session) override {
+    // Clean up when a session ends
+    publisher_->removeSubscriber(
+        std::move(session), std::nullopt, "terminateClientSession");
+  }
+
+ private:
+  std::shared_ptr<DatePublisher> publisher_;
+};
+```
+
+### Step 6: Start the Server
+
+Initialize and run your server:
+
+```cpp
+int main(int argc, char* argv[]) {
+  folly::Init init(&argc, &argv, true);
+
+  // Create publisher
+  auto publisher = std::make_shared<DatePublisher>(
+      DatePublisher::Mode::STREAM_PER_GROUP,
+      "moq-date",
+      0 /* delivery timeout */);
+
+  // Create server
+  auto server = std::make_shared<MoQDateServer>(
+      FLAGS_cert,
+      FLAGS_key,
+      "/moq-date",
+      publisher);
+
+  // Start listening
+  folly::SocketAddress addr("::", FLAGS_port);
+  server->start(addr);
+  server->waitUntilInitialized();
+
+  // Set up signal handler for graceful shutdown
+  folly::EventBase evb;
+  moxygen::SignalHandler handler(&evb, [&publisher, &server](int) {
+    publisher->stopPublishLoop();
+    server->stop();
+  });
+
+  evb.loopForever();
+  return 0;
+}
+```
+
+</Steps>
+
+## Complete Example
+
+See the full date publisher implementation in `moxygen/samples/date/MoQDateServer.cpp` for a working example that demonstrates:
+- Multiple transmission modes (stream-per-group, stream-per-object, datagram)
+- Handling SUBSCRIBE, FETCH, and TRACK_STATUS requests
+- Managing subscription lifecycle
+- Publishing time-series data
+
+## Key Concepts
+
+<Note>
+**Publisher Interface**: Implement `subscribe()`, `fetch()`, and optionally `trackStatus()` to handle client requests.
+</Note>
+
+<Note>
+**MoQForwarder**: Use the forwarder component to multicast data to multiple subscribers efficiently.
+</Note>
+
+<Warning>
+All operations on a `MoQSession` must run on the thread where it was created. Use the session's executor to schedule work.
+</Warning>
+
+## Next Steps
+
+- Learn about [Building a Subscriber](/guides/building-subscriber)
+- Explore [Setting Up a Relay](/guides/setting-up-relay)
+- Understand the [Threading Model](/guides/threading-model)

@@ -1,0 +1,442 @@
+---
+title: MoQServer
+description: Server class for accepting MOQT connections via WebTransport and native QUIC
+---
+
+## Overview
+
+`MoQServer` is the server-side class for accepting MOQT connections. It supports both HTTP/3 WebTransport and native QUIC connections, handling incoming connections and creating `MoQSession` instances for each client.
+
+**Header:** `moxygen/MoQServer.h`
+
+**Namespace:** `moxygen`
+
+## Class Definition
+
+```cpp
+class MoQServer : public MoQServerBase {
+ public:
+  // Constructor with certificate files
+  MoQServer(
+      std::string cert,
+      std::string key,
+      std::string endpoint,
+      std::optional<quic::TransportSettings> transportSettings = std::nullopt);
+
+  // Constructor with FizzServerContext
+  MoQServer(
+      std::shared_ptr<const fizz::server::FizzServerContext> fizzContext,
+      std::string endpoint,
+      std::optional<quic::TransportSettings> transportSettings = std::nullopt);
+
+  void start(const folly::SocketAddress& addr);
+  void start(const folly::SocketAddress& addr, std::vector<folly::EventBase*> evbs);
+  void stop();
+
+  std::vector<folly::EventBase*> getWorkerEvbs() const noexcept;
+  void setQuicStatsFactory(
+      std::unique_ptr<quic::QuicTransportStatsCallbackFactory> factory);
+};
+```
+
+## Constructors
+
+### Constructor with Certificate Files
+
+```cpp
+MoQServer(
+    std::string cert,
+    std::string key,
+    std::string endpoint,
+    std::optional<quic::TransportSettings> transportSettings = std::nullopt);
+```
+
+Creates a server with SSL/TLS certificates loaded from files.
+
+**Parameters:**
+- `cert` - Path to certificate file (PEM format)
+- `key` - Path to private key file (PEM format)
+- `endpoint` - HTTP endpoint path for WebTransport connections (e.g., `/moq`)
+- `transportSettings` - Optional QUIC transport settings (uses sensible defaults if not provided)
+
+### Constructor with Fizz Context
+
+```cpp
+MoQServer(
+    std::shared_ptr<const fizz::server::FizzServerContext> fizzContext,
+    std::string endpoint,
+    std::optional<quic::TransportSettings> transportSettings = std::nullopt);
+```
+
+Creates a server with a pre-configured Fizz server context for advanced SSL/TLS configuration.
+
+**Parameters:**
+- `fizzContext` - Configured Fizz server context
+- `endpoint` - HTTP endpoint path for WebTransport connections
+- `transportSettings` - Optional QUIC transport settings
+
+## Key Methods
+
+### start
+
+```cpp
+void start(const folly::SocketAddress& addr);
+void start(const folly::SocketAddress& addr, std::vector<folly::EventBase*> evbs);
+```
+
+Starts the server listening on the specified address.
+
+**Parameters:**
+- `addr` - Socket address to bind to (IP and port)
+- `evbs` - Optional vector of event bases for multi-threaded operation
+
+**Single-threaded example:**
+```cpp
+server->start(folly::SocketAddress("0.0.0.0", 4433));
+```
+
+**Multi-threaded example:**
+```cpp
+std::vector<folly::EventBase*> evbs;
+for (size_t i = 0; i < numThreads; ++i) {
+  evbs.push_back(new folly::EventBase());
+}
+server->start(folly::SocketAddress("0.0.0.0", 4433), evbs);
+```
+
+### stop
+
+```cpp
+void stop();
+```
+
+Stops the server and closes all active connections gracefully.
+
+### getWorkerEvbs
+
+```cpp
+std::vector<folly::EventBase*> getWorkerEvbs() const noexcept;
+```
+
+Returns the event bases for all worker threads.
+
+**Returns:** Vector of event base pointers used by worker threads
+
+### setQuicStatsFactory
+
+```cpp
+void setQuicStatsFactory(
+    std::unique_ptr<quic::QuicTransportStatsCallbackFactory> factory);
+```
+
+Sets a factory for creating QUIC transport statistics callbacks.
+
+**Parameters:**
+- `factory` - Factory for creating stats callbacks per connection
+
+## Usage Examples
+
+### Basic Server Setup
+
+```cpp
+#include <moxygen/MoQServer.h>
+#include <folly/init/Init.h>
+
+using namespace moxygen;
+
+int main(int argc, char* argv[]) {
+  folly::Init init(&argc, &argv, true);
+  
+  // Create server
+  auto server = std::make_shared<MoQServer>(
+      "cert.pem",      // Certificate file
+      "key.pem",       // Private key file
+      "/moq"           // WebTransport endpoint
+  );
+  
+  // Start listening
+  folly::SocketAddress addr("0.0.0.0", 4433);
+  server->start(addr);
+  
+  // Run event loop
+  folly::EventBaseManager::get()->getEventBase()->loopForever();
+  
+  return 0;
+}
+```
+
+### Relay Server with Custom Handlers
+
+```cpp
+class MoQRelayServer : public MoQServer {
+ public:
+  MoQRelayServer(const std::string& cert, const std::string& key)
+      : MoQServer(cert, key, "/moq-relay") {}
+
+  void onNewSession(std::shared_ptr<MoQSession> clientSession) override {
+    // Set handlers for each new session
+    clientSession->setPublishHandler(relay_);
+    clientSession->setSubscribeHandler(relay_);
+  }
+
+ protected:
+  std::shared_ptr<MoQSession> createSession(
+      folly::MaybeManagedPtr<proxygen::WebTransport> wt,
+      std::shared_ptr<MoQExecutor> executor) override {
+    return std::make_shared<MoQRelaySession>(
+        std::move(wt),
+        *this,
+        std::move(executor));
+  }
+
+ private:
+  std::shared_ptr<MoQRelay> relay_{std::make_shared<MoQRelay>()};
+};
+
+int main(int argc, char* argv[]) {
+  folly::Init init(&argc, &argv, true);
+  
+  auto server = std::make_shared<MoQRelayServer>("cert.pem", "key.pem");
+  server->start(folly::SocketAddress("0.0.0.0", 9668));
+  
+  folly::EventBaseManager::get()->getEventBase()->loopForever();
+  return 0;
+}
+```
+
+### Publisher Server
+
+```cpp
+class DatePublisher : public Publisher {
+ public:
+  folly::coro::Task<SubscribeResult> subscribe(
+      SubscribeRequest subReq,
+      std::shared_ptr<TrackConsumer> consumer) override {
+    
+    if (subReq.fullTrackName.trackName != "date") {
+      co_return folly::makeUnexpected(SubscribeError{
+          subReq.requestID,
+          SubscribeErrorCode::TRACK_NOT_EXIST,
+          "Track not found"});
+    }
+    
+    // Set track alias
+    consumer->setTrackAlias(TrackAlias(subReq.requestID.value));
+    
+    // Add subscriber and start publishing
+    auto session = MoQSession::getRequestSession();
+    addSubscriber(session, subReq, consumer);
+    
+    co_return SubscribeOk{
+        .requestID = subReq.requestID,
+        .expires = std::chrono::milliseconds(0),
+        .largest = currentLocation()};
+  }
+};
+
+class DateServer : public MoQServer {
+ public:
+  DateServer(const std::string& cert, const std::string& key)
+      : MoQServer(cert, key, "/moq-date"),
+        publisher_(std::make_shared<DatePublisher>()) {}
+
+  void onNewSession(std::shared_ptr<MoQSession> session) override {
+    session->setPublishHandler(publisher_);
+  }
+
+ private:
+  std::shared_ptr<DatePublisher> publisher_;
+};
+```
+
+## Transport Configuration
+
+### Default Transport Settings
+
+When `transportSettings` is not provided, `MoQServer` uses these defaults:
+
+```cpp
+quic::TransportSettings defaults;
+
+// Congestion control
+defaults.defaultCongestionController = quic::CongestionControlType::Copa;
+defaults.copaDeltaParam = 0.05;
+defaults.pacingEnabled = true;
+defaults.maxCwndInMss = quic::kLargeMaxCwndInMss;
+
+// Batching and performance
+defaults.batchingMode = quic::QuicBatchingMode::BATCHING_MODE_GSO;
+defaults.maxBatchSize = 48;
+defaults.dataPathType = quic::DataPathType::ContinuousMemory;
+defaults.maxServerRecvPacketsPerLoop = 10;
+defaults.writeConnectionDataPacketsLimit = 48;
+
+// Flow control windows (1 MB each)
+defaults.advertisedInitialConnectionFlowControlWindow = 1024 * 1024;
+defaults.advertisedInitialBidiLocalStreamFlowControlWindow = 1024 * 1024;
+defaults.advertisedInitialBidiRemoteStreamFlowControlWindow = 1024 * 1024;
+defaults.advertisedInitialUniStreamFlowControlWindow = 1024 * 1024;
+```
+
+### Custom Transport Settings
+
+```cpp
+quic::TransportSettings customSettings;
+
+// Larger flow control windows for high-bandwidth scenarios
+customSettings.advertisedInitialConnectionFlowControlWindow = 10 * 1024 * 1024;
+customSettings.advertisedInitialBidiLocalStreamFlowControlWindow = 5 * 1024 * 1024;
+
+// Custom congestion control
+customSettings.defaultCongestionController = quic::CongestionControlType::BBR;
+
+auto server = std::make_shared<MoQServer>(
+    "cert.pem",
+    "key.pem",
+    "/moq",
+    customSettings  // Use custom settings
+);
+```
+
+## Certificate Configuration
+
+### Self-Signed Certificates (Development)
+
+```bash
+# Generate self-signed certificate
+openssl req -x509 -newkey rsa:4096 \
+  -keyout key.pem -out cert.pem \
+  -days 365 -nodes \
+  -subj "/CN=localhost"
+```
+
+### Custom Fizz Context
+
+```cpp
+#include <proxygen/httpserver/samples/hq/FizzContext.h>
+
+// Create custom Fizz context
+auto fizzContext = quic::samples::createFizzServerContext(
+    {"h3", "moq-00"},  // ALPNs
+    fizz::server::ClientAuthMode::Optional,
+    "cert.pem",
+    "key.pem");
+
+auto server = std::make_shared<MoQServer>(
+    fizzContext,
+    "/moq");
+```
+
+## Multi-Threaded Operation
+
+`MoQServer` supports multi-threaded operation where each worker thread handles a subset of connections:
+
+```cpp
+const size_t numThreads = 4;
+std::vector<std::thread> threads;
+std::vector<folly::EventBase*> evbs;
+
+// Create worker threads
+for (size_t i = 0; i < numThreads; ++i) {
+  threads.emplace_back([&evbs]() {
+    folly::EventBase evb;
+    evbs.push_back(&evb);
+    evb.loopForever();
+  });
+}
+
+// Wait for event bases to be ready
+while (evbs.size() < numThreads) {
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+}
+
+// Start server with worker threads
+server->start(folly::SocketAddress("0.0.0.0", 4433), evbs);
+
+// Join threads on shutdown
+for (auto& thread : threads) {
+  thread.join();
+}
+```
+
+<Note>
+  Each `MoQSession` created by the server is bound to a single worker thread's 
+  event base and MUST only be accessed from that thread.
+</Note>
+
+## Connection Lifecycle
+
+The server handles two types of connections:
+
+### HTTP/3 WebTransport Connections
+
+1. Client sends HTTP CONNECT request to the configured endpoint
+2. Server validates the request path matches the endpoint
+3. Server responds with 200 OK and WebTransport headers
+4. Server creates `MoQSession` with the WebTransport instance
+5. `onNewSession()` is called for application setup
+
+### Native QUIC Connections
+
+1. Client establishes QUIC connection with MOQT ALPN
+2. Server accepts connection if ALPN matches
+3. Server wraps QUIC socket in `QuicWebTransport`
+4. Server creates `MoQSession` with the transport
+5. `onNewSession()` is called for application setup
+
+## Takeover Support
+
+`MoQServer` supports zero-downtime restarts via connection takeover:
+
+```cpp
+// Old process: Allow being taken over
+server->allowBeingTakenOver(folly::SocketAddress("127.0.0.1", 9999));
+int takeoverFD = server->getTakeoverHandlerSocketFD();
+std::vector<int> socketFDs = server->getAllListeningSocketFDs();
+
+// New process: Take over connections
+server->setListeningFDs(socketFDs);
+server->setProcessId(newProcessId);
+server->waitUntilInitialized();
+server->startPacketForwarding(folly::SocketAddress("127.0.0.1", 9999));
+
+// Old process: Wind down
+server->rejectNewConnections([]() { return true; });
+server->pauseRead();
+server->stop();
+```
+
+## Monitoring and Statistics
+
+```cpp
+#include <quic/api/QuicTransportStatsCallback.h>
+
+class MyStatsFactory : public quic::QuicTransportStatsCallbackFactory {
+ public:
+  std::unique_ptr<quic::QuicTransportStatsCallback> make() override {
+    return std::make_unique<MyStatsCallback>();
+  }
+};
+
+server->setQuicStatsFactory(std::make_unique<MyStatsFactory>());
+```
+
+## Error Handling
+
+```cpp
+try {
+  server->start(folly::SocketAddress("0.0.0.0", 4433));
+  XLOG(INFO) << "Server started successfully";
+} catch (const std::exception& ex) {
+  XLOG(ERR) << "Failed to start server: " << ex.what();
+  return 1;
+}
+```
+
+## See Also
+
+- [MoQClient](/api/moq-client) - Client connection class
+- [MoQSession](/api/moq-session) - Session management
+- [MoQRelay](/api/moq-relay) - Relay implementation
+- [Publisher](/api/publisher) - Publishing interface
+- [Subscriber](/api/subscriber) - Subscribing interface

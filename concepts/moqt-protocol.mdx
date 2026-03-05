@@ -1,0 +1,315 @@
+---
+title: MOQT Protocol
+description: Understanding Media over QUIC Transport protocol features and operations
+---
+
+## What is MOQT?
+
+**MOQT (Media over QUIC Transport)** is a protocol for delivering time-sensitive media content over QUIC. It's designed for:
+
+- **Live streaming**: Low-latency delivery of real-time media
+- **Media distribution**: Efficient fan-out via relay networks
+- **Time-sensitive data**: Any application requiring prioritized, ordered delivery
+
+MOQT leverages QUIC's features (streams, datagrams, multiplexing) while adding media-specific abstractions for tracks, groups, and objects.
+
+<Info>Moxygen implements the [IETF MOQT draft specification](https://datatracker.ietf.org/doc/draft-ietf-moq-transport/) and supports version negotiation for protocol evolution.</Info>
+
+## Protocol Features
+
+### Low-Latency Delivery
+
+- **Stream-based**: Objects delivered on dedicated QUIC streams with flow control
+- **Datagram mode**: Unreliable delivery for low-latency use cases
+- **Prioritization**: Publishers assign priority to groups and objects
+- **Selective reliability**: Checkpointing allows partial stream reset without data loss
+
+### Scalable Distribution
+
+- **Relay networks**: Multi-hop delivery through intermediary servers
+- **Namespace discovery**: Dynamic track discovery via PUBLISH_NAMESPACE/SUBSCRIBE_NAMESPACE
+- **Efficient forwarding**: Object deduplication and fan-out at relays
+- **Range subscriptions**: Subscribe to specific time ranges or latest data
+
+### Flexible Delivery Modes
+
+- **Object streams**: Each object on its own stream
+- **Subgroup streams**: Multiple objects per stream, grouped by subgroup
+- **Datagrams**: Unreliable delivery for real-time applications
+- **Fetch mode**: Historical data retrieval with backpressure
+
+## Core Abstractions
+
+### Tracks, Groups, and Objects
+
+MOQT organizes data hierarchically:
+
+```
+Track: "conference-123/video-alice"
+  └─ Group 0 (I-frame + dependencies)
+      ├─ Subgroup 0, Object 0 (I-frame)
+      ├─ Subgroup 1, Object 1 (P-frame)
+      └─ Subgroup 1, Object 2 (P-frame)
+  └─ Group 1 (I-frame + dependencies)
+      ├─ Subgroup 0, Object 0 (I-frame)
+      └─ ...
+```
+
+**Track**: A named stream of time-ordered data
+- Identified by namespace + track name (e.g., `["conference-123", "video-alice"]`)
+- Contains a sequence of groups
+
+**Group**: A unit of time or independently decodable content
+- Identified by incrementing group ID
+- Contains one or more subgroups
+- Typically corresponds to a video GOP or audio frame
+
+**Subgroup**: Objects with the same priority within a group
+- Identified by group ID + subgroup ID
+- Delivered on a single stream
+- Objects within a subgroup are strictly ordered
+
+**Object**: The atomic unit of data
+- Identified by group ID + subgroup ID + object ID
+- Contains payload bytes and optional extensions
+- Can have status (NORMAL, END_OF_GROUP, END_OF_TRACK)
+
+### Track Namespace
+
+Tracks are organized into hierarchical namespaces:
+
+```cpp
+TrackNamespace ns = {"conference-123", "video"};
+TrackName name = "alice";
+FullTrackName ftn = {ns, name}; // conference-123/video/alice
+```
+
+Namespaces enable:
+- **Organization**: Group related tracks (e.g., all streams in a conference)
+- **Discovery**: Subscribe to namespace prefixes to discover available tracks
+- **Authorization**: Control access at namespace level
+
+## MOQT Operations
+
+### SUBSCRIBE: Real-Time Streaming
+
+Subscribe to a track to receive objects in real-time:
+
+```cpp
+SubscribeRequest sub;
+sub.fullTrackName = {{"conference-123", "video"}, "alice"};
+sub.startLocation = SubscribeLocation::Latest(); // Start from latest group
+sub.endLocation = std::nullopt; // No end (infinite subscription)
+sub.priority = 128; // Lower number = higher priority
+
+auto result = co_await session->subscribe(sub, trackConsumer);
+if (result.hasValue()) {
+    auto handle = result.value();
+    // Use handle to unsubscribe or update subscription
+}
+```
+
+**Start/End Locations**: Control which objects to receive
+- `SubscribeLocation::Latest()`: Start from the latest group
+- `SubscribeLocation::Absolute(group, object)`: Start from specific position
+- `std::nullopt`: No end (subscription continues until unsubscribed)
+
+**Forward Preferences**: Control how relays forward data
+- `TrackForwardPreference::Group`: Forward entire groups
+- `TrackForwardPreference::Object`: Forward individual objects
+- `TrackForwardPreference::Datagram`: Use datagram delivery
+
+### FETCH: Historical Data Retrieval
+
+Fetch historical data with explicit backpressure control:
+
+```cpp
+Fetch fetch;
+fetch.fullTrackName = {{"conference-123", "video"}, "alice"};
+fetch.start = AbsoluteLocation{0, 0}; // Group 0, Object 0
+fetch.end = AbsoluteLocation{100, 0}; // Through Group 100
+fetch.priority = 128;
+
+auto result = co_await session->fetch(fetch, fetchConsumer);
+if (result.hasValue()) {
+    auto handle = result.value();
+    // Use handle to cancel fetch
+}
+```
+
+<Info>FETCH enforces strict ordering: objects must be delivered in increasing group/object order. The consumer can apply backpressure using `awaitReadyToConsume()`.</Info>
+
+### PUBLISH: Announcing Track Availability
+
+Publish makes a track available to subscribers:
+
+```cpp
+PublishRequest pub;
+pub.fullTrackName = {{"conference-123", "video"}, "alice"};
+pub.forward = true; // Allow relays to forward this track
+
+// Synchronous API returns consumer immediately
+auto result = session->publish(pub);
+if (result.hasValue()) {
+    auto [consumer, replyTask] = std::move(result.value());
+    
+    // Start publishing data immediately
+    auto subgroup = consumer->beginSubgroup(0, 0, 128).value();
+    subgroup->object(0, payload);
+    
+    // Await PUBLISH_OK asynchronously
+    auto reply = co_await std::move(replyTask);
+}
+```
+
+<Info>The PUBLISH operation uses a synchronous API so publishers can start sending data immediately without waiting for PUBLISH_OK from the peer.</Info>
+
+### PUBLISH_NAMESPACE / SUBSCRIBE_NAMESPACE: Track Discovery
+
+Dynamic track discovery for relay scenarios:
+
+```cpp
+// Publisher announces namespace
+PublishNamespace ann;
+ann.trackNamespace = {"conference-123", "video"};
+
+auto result = co_await session->publishNamespace(ann);
+
+// Subscriber discovers tracks in namespace
+SubscribeNamespace subAnn;
+subAnn.trackNamespacePrefix = {"conference-123"}; // All tracks in conference
+
+auto result = co_await session->subscribeNamespace(
+    subAnn,
+    namespacePublishHandle
+);
+
+// Receive NAMESPACE messages via namespacePublishHandle
+// Each message announces a new track becoming available
+```
+
+**Use Cases:**
+- Conference systems: Discover participants' streams dynamically
+- CDN scenarios: Learn about available content from origin
+- Multi-tenant systems: Browse available namespaces
+
+## Version Negotiation
+
+Moxygen supports multiple MOQT protocol versions:
+
+```cpp
+// Configure supported versions
+session->setVersion(kVersionDraft06);
+
+// After setup, check negotiated version
+auto version = session->getNegotiatedVersion();
+if (version.has_value()) {
+    XLOG(INFO) << "Negotiated MOQT version: " << *version;
+}
+```
+
+Version negotiation happens during setup:
+1. Client sends `CLIENT_SETUP` with list of supported versions
+2. Server responds with `SERVER_SETUP` choosing a version
+3. Both sides adapt behavior based on negotiated version
+
+Some features vary by version:
+- Request ID handling (some versions require IDs for PUBLISH)
+- Parameter encoding (auth token aliasing in newer versions)
+- Message types (SUBSCRIBE_NAMESPACE separate stream in draft 16+)
+
+## Extensions and Parameters
+
+MOQT supports protocol extensibility:
+
+### Track Request Parameters
+
+Passed with SUBSCRIBE/FETCH requests:
+
+```cpp
+std::vector<Parameter> params;
+
+// Delivery timeout (milliseconds)
+params.push_back(Parameter{
+    ParameterKey::DELIVERY_TIMEOUT,
+    folly::to<uint64_t>(5000)
+});
+
+// Authorization token
+params.push_back(Parameter{
+    ParameterKey::AUTHORIZATION_INFO,
+    "bearer-token-xyz"
+});
+
+subReq.parameters = std::move(params);
+```
+
+**Common Parameters:**
+- `DELIVERY_TIMEOUT`: Drop objects not delivered within timeout
+- `AUTHORIZATION_INFO`: Bearer tokens or other auth credentials
+- `MAX_CACHE_DURATION`: Hint for relay caching behavior
+
+### Object Extensions
+
+Attached to individual objects:
+
+```cpp
+Extensions extensions;
+extensions.push_back(Extension{
+    ExtensionType::CUSTOM,
+    folly::IOBuf::copyBuffer("custom-metadata")
+});
+
+subgroup->object(objectID, payload, extensions);
+```
+
+Extensions enable:
+- Custom metadata per object
+- Application-specific signaling
+- Future protocol enhancements
+
+## Session Management
+
+### GOAWAY: Graceful Shutdown
+
+Signal that no new requests will be accepted:
+
+```cpp
+Goaway goaway;
+goaway.newSessionUri = "https://relay2.example.com/moq";
+session->goaway(goaway);
+```
+
+After sending GOAWAY:
+- Existing subscriptions continue
+- New subscription requests are rejected
+- Clients can reconnect to `newSessionUri`
+
+### MAX_REQUEST_ID: Request Flow Control
+
+Control how many concurrent requests a peer can initiate:
+
+```cpp
+// Limit peer to 100 concurrent subscriptions
+session->setMaxConcurrentRequests(100);
+
+// Request IDs are assigned sequentially
+// Peer must wait for requests to complete before exceeding limit
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Publisher & Subscriber" icon="arrows-left-right" href="/concepts/publisher-subscriber">
+    Learn the symmetric interface design
+  </Card>
+  <Card title="Flow Control" icon="gauge-high" href="/concepts/flow-control">
+    Manage backpressure and buffering
+  </Card>
+  <Card title="Relay & Forwarding" icon="server" href="/concepts/relay-forwarding">
+    Build relay servers
+  </Card>
+  <Card title="Getting Started" icon="rocket" href="/getting-started/quickstart">
+    Build your first MOQT application
+  </Card>
+</CardGroup>
