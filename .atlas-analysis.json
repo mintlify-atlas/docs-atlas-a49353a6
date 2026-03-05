@@ -1,0 +1,135 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "Moxygen",
+  "projectDescription": "C++ library for implementing MOQT (Media over QUIC Transport) applications with support for publishers, subscribers, and relays",
+  "theme": "aspen",
+  "primaryColor": "#fcd554",
+  "lightColor": "#fce386",
+  "darkColor": "#bfbec5",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": ["introduction", "installation", "quickstart"]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/architecture",
+              "concepts/moqt-protocol",
+              "concepts/publisher-subscriber",
+              "concepts/relay-forwarding",
+              "concepts/flow-control"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/building-publisher",
+              "guides/building-subscriber",
+              "guides/setting-up-relay",
+              "guides/media-streaming",
+              "guides/threading-model"
+            ]
+          },
+          {
+            "group": "Sample Applications",
+            "pages": [
+              "samples/overview",
+              "samples/date-server",
+              "samples/text-client",
+              "samples/chat-client",
+              "samples/flv-streaming"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Core Classes",
+            "pages": [
+              "api/moq-session",
+              "api/moq-relay-session",
+              "api/publisher",
+              "api/subscriber"
+            ]
+          },
+          {
+            "group": "Consumers",
+            "pages": [
+              "api/track-consumer",
+              "api/subgroup-consumer",
+              "api/fetch-consumer"
+            ]
+          },
+          {
+            "group": "Transport",
+            "pages": [
+              "api/moq-client",
+              "api/moq-server",
+              "api/web-transport"
+            ]
+          },
+          {
+            "group": "Relay & Forwarding",
+            "pages": [
+              "api/moq-relay",
+              "api/moq-forwarder",
+              "api/moq-cache"
+            ]
+          },
+          {
+            "group": "Media",
+            "pages": [
+              "api/moq-mi",
+              "api/flv-parser"
+            ]
+          },
+          {
+            "group": "Utilities",
+            "pages": [
+              "api/moq-types",
+              "api/moq-executor",
+              "api/moq-stats"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Complete MOQT protocol implementation with symmetric Publisher/Subscriber APIs",
+    "Transport-agnostic design supporting HTTP/3 WebTransport and native QUIC",
+    "Built-in relay and forwarding capabilities with namespace routing",
+    "Object caching support for serving historical data to new subscribers",
+    "Media streaming with MoqMi packaging and FLV format support",
+    "Coroutine-based async APIs using Folly",
+    "Flow control and backpressure management at multiple levels",
+    "Comprehensive sample applications (date server, chat, media streaming)"
+  ],
+  "publicApiSurface": [
+    "Publisher::subscribe",
+    "Publisher::fetch",
+    "Publisher::subscribeNamespace",
+    "Publisher::trackStatus",
+    "Subscriber::publishNamespace",
+    "Subscriber::publish",
+    "MoQSession::start",
+    "MoQSession::setup",
+    "MoQRelaySession",
+    "MoQClient::connect",
+    "MoQServer::start",
+    "MoQRelay",
+    "MoQForwarder",
+    "MoQCache",
+    "TrackConsumer::beginSubgroup",
+    "TrackConsumer::objectStream",
+    "SubgroupConsumer::object",
+    "FetchConsumer::awaitReadyToConsume"
+  ]
+}
